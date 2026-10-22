@@ -4,8 +4,10 @@ import webbrowser
 import threading
 import json
 import random
+import os  # <-- ADDED
 
-PORT = 8000
+# CHANGED: read PORT from env (Render injects this). Falls back to 8000 locally.
+PORT = int(os.environ.get("PORT", 8000))
 
 WORD_BANK = [
     # 1-10: Everyday objects
@@ -635,10 +637,13 @@ def open_browser():
 
 def main():
     socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("", PORT), GameHandler) as httpd:
-        print(f"Server running at http://localhost:{PORT}/")
+    # CHANGED: bind to 0.0.0.0 so Render's router can reach the process.
+    with socketserver.TCPServer(("0.0.0.0", PORT), GameHandler) as httpd:
+        print(f"Server running at http://0.0.0.0:{PORT}/")
         print("Press Ctrl+C to stop.")
-        threading.Timer(1.0, open_browser).start()
+        # CHANGED: only open a browser locally; on Render this would just fail silently.
+        if not os.environ.get("RENDER"):
+            threading.Timer(1.0, open_browser).start()
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
