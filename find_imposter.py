@@ -189,7 +189,7 @@ def _public_state(game, token):
         "imposter_count": game["imposter_count"],
         "chat": game.get("chat", [])[-60:],
         "chat_open": game.get("chat_open", True),
-        "reactions": game.get("reactions", []), # LIVE REACTIONS
+        "reactions": game.get("reactions", []),
         "you": None,
     }
     if me:
@@ -280,7 +280,7 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             "/api/vote": self._handle_vote,
             "/api/reset": self._handle_reset,
             "/api/chat": self._handle_chat,
-            "/api/react": self._handle_react, # NEW
+            "/api/react": self._handle_react,
             "/api/leave": self._handle_leave,
             "/api/kick": self._handle_kick,
             "/api/end": self._handle_end,
@@ -423,7 +423,7 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             game["vote_counts"] = {}
             game["voted_out_name"] = None
             game["vote_tie"] = False
-            game["reactions"] = [] # Clear reactions
+            game["reactions"] = []
             self._add_chat(game, "System", "Game started! Check your secret role.")
             self._json(200, _public_state(game, token))
         self._with_game(payload, run)
@@ -489,7 +489,7 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                     game["phase"] = "vote"
                     for p in game["players"]:
                         p["vote"] = None
-            game["reactions"] = [] # Clear reactions on phase change
+            game["reactions"] = []
             self._json(200, _public_state(game, token))
         self._with_game(payload, run)
 
@@ -601,13 +601,11 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
         def run(game, token, payload):
             me = self._find_player(game, token)
             if emoji:
-                # Limit reaction list size and add timestamp
                 game.setdefault("reactions", []).append({
                     "emoji": emoji,
                     "name": me["name"],
                     "ts": time.time()
                 })
-                # Keep only reactions from the last 3 seconds to prevent spam
                 now = time.time()
                 game["reactions"] = [r for r in game["reactions"] if now - r["ts"] < 3.0]
             self._json(200, {"ok": True})
@@ -659,7 +657,7 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
 
 
 # ===========================================================================
-# HTML (GAME ARENA THEME + TUTORIAL + REACTIONS)
+# HTML (GAME ARENA THEME + TUTORIAL + REACTIONS + ANIMATED BG)
 # ===========================================================================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -937,23 +935,94 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .badge { display:inline-block; background: rgba(0, 243, 255, 0.1); border: 1px solid var(--neon-cyan); color: var(--neon-cyan); padding: 4px 12px; border-radius: 4px; font-size:0.8rem; font-weight:600; text-transform: uppercase; font-family: var(--font-mono); letter-spacing: 1px; }
   .badge.local { background: rgba(0, 255, 102, 0.1); border-color: var(--neon-green); color: var(--neon-green); }
 
-  /* ================= TUTORIAL MODAL ================= */
+  /* ================= TUTORIAL MODAL & ANIMATED BACKGROUND ================= */
   .tutorial-modal {
-    position: fixed; inset: 0; background: rgba(5, 5, 15, 0.9); backdrop-filter: blur(8px);
+    position: fixed; inset: 0; background: rgba(5, 5, 15, 0.95); backdrop-filter: blur(8px);
     z-index: 500; display: none; align-items: center; justify-content: center; padding: 20px;
+    overflow: hidden; /* Hide anything going outside the modal */
   }
   .tutorial-modal.open { display: flex; }
-  .tutorial-card {
-    background: #0f172a; border: 1px solid var(--neon-purple); border-radius: 16px;
-    padding: 24px; max-width: 500px; width: 100%; max-height: 85vh; overflow-y: auto;
-    box-shadow: 0 0 30px rgba(176, 38, 255, 0.2);
+
+  /* ANIMATED BACKGROUND LAYER */
+  .tutorial-bg {
+    position: absolute; inset: 0; z-index: 1;
+    pointer-events: none; /* Let clicks pass through */
+    opacity: 0.15;
   }
-  .tutorial-card h2 { color: var(--neon-purple); text-shadow: 0 0 10px rgba(176,38,255,0.5); margin-bottom: 16px; }
-  .tutorial-step { margin-bottom: 20px; padding-left: 16px; border-left: 2px solid var(--neon-cyan); }
+
+  /* Moving Grid */
+  .bg-grid {
+    position: absolute; inset: -100%;
+    background-image: 
+      linear-gradient(var(--neon-cyan) 1px, transparent 1px),
+      linear-gradient(90deg, var(--neon-cyan) 1px, transparent 1px);
+    background-size: 40px 40px;
+    animation: moveGrid 20s linear infinite;
+  }
+  @keyframes moveGrid {
+    0% { transform: translate(0, 0); }
+    100% { transform: translate(40px, 40px); }
+  }
+
+  /* Sneaking Spy */
+  .bg-spy {
+    position: absolute; bottom: 10%; left: -100px;
+    font-size: 5rem; filter: drop-shadow(0 0 10px var(--neon-red));
+    animation: sneak 8s linear infinite;
+  }
+  @keyframes sneak {
+    0% { left: -100px; transform: scaleX(1); }
+    45% { left: 50%; transform: scaleX(1); }
+    50% { left: 50%; transform: scaleX(-1); } /* Turn around */
+    95% { left: -100px; transform: scaleX(-1); }
+    100% { left: -100px; transform: scaleX(1); }
+  }
+
+  /* Floating Question Marks */
+  .bg-q {
+    position: absolute; font-size: 3rem; font-family: var(--font-ui); font-weight: 800;
+    color: var(--neon-purple); text-shadow: 0 0 10px var(--neon-purple);
+    animation: floatUpFade 4s ease-in infinite;
+  }
+  .bg-q.q1 { left: 20%; bottom: -50px; animation-delay: 0s; }
+  .bg-q.q2 { left: 70%; bottom: -50px; animation-delay: 1.5s; font-size: 2rem; }
+  .bg-q.q3 { left: 45%; bottom: -50px; animation-delay: 2.5s; font-size: 4rem; }
+  
+  @keyframes floatUpFade {
+    0% { transform: translateY(0) scale(0.5); opacity: 0; }
+    20% { opacity: 1; transform: translateY(-100px) scale(1); }
+    80% { opacity: 1; transform: translateY(-300px) scale(1.2); }
+    100% { opacity: 0; transform: translateY(-400px) scale(1.5); }
+  }
+
+  /* Scanning Magnifying Glass */
+  .bg-mag {
+    position: absolute; top: 20%; left: 10%;
+    font-size: 4rem; opacity: 0.8;
+    animation: scan 6s ease-in-out infinite;
+  }
+  @keyframes scan {
+    0%, 100% { transform: translate(0, 0) rotate(-15deg); }
+    25% { transform: translate(200px, 50px) rotate(15deg); }
+    50% { transform: translate(400px, -20px) rotate(-15deg); }
+    75% { transform: translate(150px, 100px) rotate(15deg); }
+  }
+
+  /* Modal Content */
+  .tutorial-card {
+    position: relative; z-index: 10; /* Sit above the animation */
+    background: rgba(15, 23, 42, 0.85); /* Slightly transparent to see anim */
+    backdrop-filter: blur(12px); /* Blur the animation behind the text */
+    border: 1px solid var(--neon-cyan); border-radius: 16px;
+    padding: 24px; max-width: 500px; width: 100%; max-height: 85vh; overflow-y: auto;
+    box-shadow: 0 0 40px rgba(0, 243, 255, 0.2);
+  }
+  .tutorial-card h2 { color: var(--neon-cyan); text-shadow: 0 0 10px rgba(0,243,255,0.5); margin-bottom: 16px; }
+  .tutorial-step { margin-bottom: 20px; padding-left: 16px; border-left: 2px solid var(--neon-purple); }
   .tutorial-step h4 { color: #fff; font-size: 1.1rem; margin-bottom: 4px; text-transform: uppercase; }
-  .tutorial-step p { color: var(--text-muted); font-size: 0.9rem; line-height: 1.5; font-family: var(--font-mono); }
-  .tutorial-card button { border-color: var(--neon-purple); color: var(--neon-purple); background: rgba(176,38,255,0.1); }
-  .tutorial-card button:hover { background: rgba(176,38,255,0.2); box-shadow: 0 0 20px rgba(176,38,255,0.4); }
+  .tutorial-step p { color: var(--text-main); font-size: 0.9rem; line-height: 1.5; font-family: var(--font-mono); }
+  .tutorial-card button { border-color: var(--neon-cyan); color: var(--neon-cyan); background: rgba(0,243,255,0.1); }
+  .tutorial-card button:hover { background: rgba(0,243,255,0.2); box-shadow: 0 0 20px rgba(0,243,255,0.4); }
 
   /* ================= LIVE REACTIONS ================= */
   .reaction-bar {
@@ -1167,8 +1236,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <button class="reaction-btn" onclick="sendReaction('🕵️')">🕵️</button>
 </div>
 
-<!-- TUTORIAL MODAL -->
+<!-- TUTORIAL MODAL WITH ANIMATED BACKGROUND -->
 <div class="tutorial-modal" id="tutorialModal">
+  
+  <!-- BACKGROUND ANIMATIONS -->
+  <div class="tutorial-bg">
+    <div class="bg-grid"></div>
+    <div class="bg-spy">🕵️</div>
+    <div class="bg-mag">🔍</div>
+    <div class="bg-q q1">?</div>
+    <div class="bg-q q2">?</div>
+    <div class="bg-q q3">?</div>
+  </div>
+
+  <!-- CONTENT -->
   <div class="tutorial-card">
     <h2>How to Play</h2>
     <div class="tutorial-step">
@@ -1311,7 +1392,6 @@ function toggleTutorial() {
 // ============================================================================
 async function sendReaction(emoji) {
   if (!session || local) return;
-  // Optimistic UI
   spawnFloatingEmoji(emoji);
   try { await api('react', { ...session, emoji }); } catch(e) {}
 }
@@ -1320,7 +1400,6 @@ function spawnFloatingEmoji(emoji) {
   const el = document.createElement('div');
   el.className = 'floating-reaction';
   el.textContent = emoji;
-  // random horizontal position
   el.style.left = (20 + Math.random() * 60) + '%';
   document.body.appendChild(el);
   setTimeout(() => el.remove(), 2000);
@@ -1330,12 +1409,10 @@ function checkReactions(s) {
   if (!s.reactions || s.reactions.length === 0) return;
   const now = Date.now() / 1000;
   s.reactions.forEach(r => {
-    // Use a unique key based on timestamp and name to avoid double-rendering
     const key = r.ts + '_' + r.name;
     if (!activeReactionTimers[key] && (now - r.ts < 2.5)) {
       activeReactionTimers[key] = true;
       spawnFloatingEmoji(r.emoji);
-      // Cleanup after 2.5s
       setTimeout(() => { delete activeReactionTimers[key]; }, 2500);
     }
   });
@@ -1415,11 +1492,11 @@ function applyState(s) {
   else if (p === 'result')  renderResult(s);
   
   updateChatBadge(s);
-  checkReactions(s); // LIVE REACTIONS
+  checkReactions(s); 
   
   if (chatOpen) renderChat(s);
   $('menuFab').style.display = 'flex';
-  $('reactionBar').classList.add('active'); // SHOW REACTIONS
+  $('reactionBar').classList.add('active');
   
   $('menuRoomCode').textContent = s.code;
   $('menuYouName').textContent = s.you ? s.you.name : '—';
@@ -1519,14 +1596,11 @@ function renderClue(s) {
   $('cluePlayerName').textContent = s.you ? s.you.name : '—';
   $('cluePlayerName').className = 'badge';
   
-  // FIX: Explicitly clear the text field if the player has not submitted a clue yet.
-  // This guarantees round 2 inputs are blank.
   const submitted = s.you.clue || s.you.clue_audio;
+  
   if (!submitted) {
-    if (!$('clueInput').disabled) {
-       // only clear if it's currently active, to avoid wiping what they are typing on a poll tick
-    } else {
-       $('clueInput').value = ''; // was disabled, now active
+    if ($('clueInput').disabled) {
+       $('clueInput').value = '';
     }
   }
   
@@ -1887,7 +1961,6 @@ function localRenderClue() {
   $('cluePlayerName').textContent = p.name;
   $('cluePlayerName').className = 'badge local';
   
-  // FIX: Always blank the input when advancing to the next player
   $('clueInput').value = '';
   
   $('clueInput').disabled = false;
