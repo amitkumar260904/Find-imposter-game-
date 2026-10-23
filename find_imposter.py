@@ -322,7 +322,7 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
         return next((p for p in game["players"] if p["token"] == token), None)
 
     def _add_chat(self, game, sender_name, text):
-        text = (text or "").strip()[:MAX_CHAT_LEN]
+        text = str(text or "").strip()[:MAX_CHAT_LEN]
         if not text:
             return
         entry = {"ts": int(time.time() * 1000), "name": sender_name, "text": text}
@@ -575,20 +575,22 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_chat(self):
         payload = self._read_json() or {}
-        text = payload.get("text") or ""
-
+        
         def run(game, token, payload):
+            # extract text strictly inside the closure to avoid scoping issues
+            raw_text = payload.get("text", "")
+            text = str(raw_text).strip()[:MAX_CHAT_LEN]
+            
             if not game.get("chat_open", True):
                 return self._json(403, {"error": "chat_locked"})
             me = self._find_player(game, token)
             if not me:
                 return self._json(403, {"error": "not_in_game"})
-            if not isinstance(text, str) or not text.strip():
+            if not text:
                 return self._json(400, {"error": "empty"})
-            if len(text) > MAX_CHAT_LEN:
-                text = text[:MAX_CHAT_LEN]
             if game["phase"] == "clue" and not (me["clue"] or me.get("clue_audio")):
                 return self._json(403, {"error": "chat_blocked_during_clue"})
+            
             self._add_chat(game, me["name"], text)
             self._json(200, _public_state(game, token))
 
@@ -1067,7 +1069,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const STORAGE_KEY = 'imposter_session_v6';
+const STORAGE_KEY = 'imposter_session_v7';
 let session = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
 let current = null;
 let pollTimer = null;
@@ -1448,7 +1450,6 @@ function renderResult(s) {
 
 async function playAgain() {
   if (local) {
-    // Local play again: reuse existing players + scores
     const scores = local.players.map(p => p.score || 0);
     const names = local.players.map(p => p.name);
     localNames = names;
@@ -1660,7 +1661,7 @@ function localHideAndContinue() {
 }
 
 // ============================================================================
-// LOCAL CLUES  ← THE FIXED FUNCTION
+// LOCAL CLUES
 // ============================================================================
 function localRenderClue() {
   if (!local) return;
@@ -1699,14 +1700,13 @@ function localSubmitClue(kind) {
   if (!local) return;
   const p = local.players[local.clueIndex];
   if (!p) return;
-  if (p.clue || p.clueAudio) return;   // double-submit guard
+  if (p.clue || p.clueAudio) return;
 
   $('clueError').textContent = '';
 
   if (kind === 'text') {
     const text = ($('clueInput').value || '').trim();
     if (!text) { $('clueError').textContent = 'Please type a clue.'; return; }
-    // FIXED: was using `in` on a string (throws TypeError), now uses .includes
     const w = (local.word || '').toLowerCase();
     if (w && text.toLowerCase().includes(w)) {
       $('clueError').textContent = '❌ Your clue contains the secret word!';
