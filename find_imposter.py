@@ -9,7 +9,6 @@ import secrets
 import time
 import string
 import urllib.parse
-import base64
 import signal
 import sys
 
@@ -128,21 +127,16 @@ WORD_BANK = [
 GAMES = {}
 GAMES_LOCK = threading.Lock()
 GAME_TTL_SECONDS = 3 * 60 * 60
-MAX_VOICE_BYTES = 60_000          # ~10s webm/opus mono ≈ 20-40KB
-MAX_CLIP_COUNT = 4                # per player per game
+MAX_VOICE_BYTES = 60_000
 MAX_CHAT_LEN = 200
 MAX_CHAT_HISTORY = 200
 
-# ===========================================================================
-# HELPERS
-# ===========================================================================
 def _cleanup_stale_games():
     now = time.time()
     with GAMES_LOCK:
         stale = [c for c, g in GAMES.items() if now - g["last_activity"] > GAME_TTL_SECONDS]
         for c in stale:
             del GAMES[c]
-
 
 def _new_code():
     alphabet = string.ascii_uppercase + string.digits
@@ -151,15 +145,13 @@ def _new_code():
         if code not in GAMES:
             return code
 
-
 def _make_player(token, name):
     return {
         "token": token, "name": name, "joined_at": time.time(),
         "role_word": "", "role_hint": "", "is_imposter": False,
         "clue": "", "clue_audio": None, "vote": None, "ready": False,
-        "score": 0, "connected": True,
+        "score": 0,
     }
-
 
 def _tally_votes(game):
     counts = {p["name"]: 0 for p in game["players"]}
@@ -171,7 +163,6 @@ def _tally_votes(game):
     if len(leaders) == 1:
         return leaders[0], False, counts
     return None, True, counts
-
 
 def _public_state(game, token):
     players = []
@@ -191,24 +182,19 @@ def _public_state(game, token):
     me = next((p for p in game["players"] if p["token"] == token), None)
     host = next((p for p in game["players"] if p["token"] == game["host_token"]), None)
     state = {
-        "code": game["code"],
-        "phase": game["phase"],
-        "lang": game["lang"],
-        "round": game["round"],
-        "players": players,
+        "code": game["code"], "phase": game["phase"], "lang": game["lang"],
+        "round": game["round"], "players": players,
         "is_host": bool(me and me["token"] == game["host_token"]),
         "host_name": host["name"] if host else "",
         "imposter_count": game["imposter_count"],
-        "chat": game.get("chat", [])[-60:],           # last 60 messages
+        "chat": game.get("chat", [])[-60:],
         "chat_open": game.get("chat_open", True),
         "you": None,
     }
     if me:
         state["you"] = {
-            "name": me["name"],
-            "ready": me["ready"],
-            "clue": me["clue"],
-            "clue_audio": me.get("clue_audio"),
+            "name": me["name"], "ready": me["ready"],
+            "clue": me["clue"], "clue_audio": me.get("clue_audio"),
             "has_voted": me["vote"] is not None,
             "score": me.get("score", 0),
         }
@@ -228,7 +214,7 @@ def _public_state(game, token):
 
 
 # ===========================================================================
-# HTTP HANDLER
+# HTTP HANDLER (unchanged from previous version — online mode)
 # ===========================================================================
 class GameHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -269,6 +255,9 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "games": len(GAMES), "ts": int(time.time())})
         elif path in ("/health", "/healthz"):
             self._json(200, {"status": "ok", "games": len(GAMES), "uptime": int(time.time() - START_TIME)})
+        elif path == "/api/words":
+            # Local mode fetches the word bank once — no per-game server state.
+            self._json(200, {"words": WORD_BANK})
         elif path == "/join":
             qs = urllib.parse.urlparse(self.path).query
             self.send_response(302)
@@ -308,7 +297,6 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    # ---------------------------------------------------------------- util
     def _with_game(self, payload, fn):
         if not payload:
             return self._json(400, {"error": "bad request"})
@@ -335,7 +323,6 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
         game.setdefault("chat", []).append(entry)
         game["chat"] = game["chat"][-MAX_CHAT_HISTORY:]
 
-    # ------------------------------------------------------------- create
     def _handle_create(self):
         payload = self._read_json() or {}
         lang = payload.get("lang", "en")
@@ -346,8 +333,7 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
         with GAMES_LOCK:
             code = _new_code()
             GAMES[code] = {
-                "code": code, "lang": lang, "phase": "lobby",
-                "host_token": token,
+                "code": code, "lang": lang, "phase": "lobby", "host_token": token,
                 "players": [_make_player(token, name)],
                 "word": "", "imposter_hint": "", "imposter_index": 0,
                 "imposter_count": 1, "imposter_names": [],
@@ -359,7 +345,6 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             game = GAMES[code]
         self._json(200, {"code": code, "token": token, "state": _public_state(game, token)})
 
-    # --------------------------------------------------------------- join
     def _handle_join(self):
         payload = self._read_json() or {}
         code = (payload.get("code") or "").upper().strip()
@@ -381,26 +366,21 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             self._add_chat(game, "System", f"{name} joined the room")
         self._json(200, {"code": code, "token": token, "state": _public_state(game, token)})
 
-    # -------------------------------------------------------------- state
     def _handle_state(self):
         payload = self._read_json() or {}
         self._with_game(payload, lambda g, t, p: self._json(200, _public_state(g, t)))
 
     def _handle_ready(self):
         payload = self._read_json() or {}
-
         def run(game, token, payload):
             me = self._find_player(game, token)
             me["ready"] = bool(payload.get("ready", True))
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # -------------------------------------------------------------- start
     def _handle_start(self):
         payload = self._read_json() or {}
         num_imposters = payload.get("num_imposters", 1)
-
         def run(game, token, payload):
             if token != game["host_token"]:
                 return self._json(403, {"error": "host_only"})
@@ -430,25 +410,17 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     p["role_word"] = game["word"]
                     p["role_hint"] = ""
-                p["clue"] = ""
-                p["clue_audio"] = None
-                p["vote"] = None
-            game["phase"] = "reveal"
-            game["round"] = 1
-            game["result_banner"] = ""
-            game["vote_counts"] = {}
-            game["voted_out_name"] = None
-            game["vote_tie"] = False
+                p["clue"] = ""; p["clue_audio"] = None; p["vote"] = None
+            game["phase"] = "reveal"; game["round"] = 1
+            game["result_banner"] = ""; game["vote_counts"] = {}
+            game["voted_out_name"] = None; game["vote_tie"] = False
             self._add_chat(game, "System", "Game started! Check your secret role.")
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # --------------------------------------------------------------- clue
     def _handle_clue(self):
         payload = self._read_json() or {}
         text = (payload.get("text") or "").strip()[:80]
-
         def run(game, token, payload):
             if game["phase"] != "clue":
                 return self._json(409, {"error": "not_clue_phase"})
@@ -457,21 +429,17 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "empty_clue"})
             if me["clue"] or me.get("clue_audio"):
                 return self._json(409, {"error": "already_submitted"})
-            # reject clue that contains the actual word (basic anti-cheat)
             if game["word"] and game["word"].lower() in text.lower():
                 return self._json(400, {"error": "contains_word"})
             me["clue"] = text
             if all(p["clue"] or p.get("clue_audio") for p in game["players"]):
                 game["phase"] = "summary"
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # -------------------------------------------------------------- audio
     def _handle_audio(self):
         payload = self._read_json() or {}
         data = payload.get("audio") or ""
-
         def run(game, token, payload):
             if game["phase"] != "clue":
                 return self._json(409, {"error": "not_clue_phase"})
@@ -483,46 +451,36 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             if len(data) > MAX_VOICE_BYTES:
                 return self._json(413, {"error": "audio_too_large"})
             me["clue_audio"] = data
-            me["clue"] = ""   # voice replaces text
+            me["clue"] = ""
             if all(p["clue"] or p.get("clue_audio") for p in game["players"]):
                 game["phase"] = "summary"
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # ------------------------------------------------------------ advance
     def _handle_advance(self):
         payload = self._read_json() or {}
-
         def run(game, token, payload):
             if token != game["host_token"]:
                 return self._json(403, {"error": "host_only"})
             if game["phase"] == "reveal":
-                game["phase"] = "clue"
-                game["round"] = 1
+                game["phase"] = "clue"; game["round"] = 1
                 for p in game["players"]:
-                    p["clue"] = ""
-                    p["clue_audio"] = None
+                    p["clue"] = ""; p["clue_audio"] = None
             elif game["phase"] == "summary":
                 if game["round"] == 1:
-                    game["round"] = 2
-                    game["phase"] = "clue"
+                    game["round"] = 2; game["phase"] = "clue"
                     for p in game["players"]:
-                        p["clue"] = ""
-                        p["clue_audio"] = None
+                        p["clue"] = ""; p["clue_audio"] = None
                 else:
                     game["phase"] = "vote"
                     for p in game["players"]:
                         p["vote"] = None
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # --------------------------------------------------------------- vote
     def _handle_vote(self):
         payload = self._read_json() or {}
         target = payload.get("target")
-
         def run(game, token, payload):
             if game["phase"] != "vote":
                 return self._json(409, {"error": "not_vote_phase"})
@@ -540,17 +498,12 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                 game["vote_tie"] = is_tie
                 game["voted_out_name"] = top_name
                 imposter_names = set(game["imposter_names"])
-                crew_count = len(game["players"]) - len(imposter_names)
                 if is_tie:
                     game["result_banner"] = "imposter"
                 elif top_name in imposter_names:
-                    if len(imposter_names) == 1:
-                        game["result_banner"] = "crew"
-                    else:
-                        game["result_banner"] = "imposter"
+                    game["result_banner"] = "crew" if len(imposter_names) == 1 else "imposter"
                 else:
                     game["result_banner"] = "imposter"
-                # scoring
                 if game["result_banner"] == "crew":
                     for p in game["players"]:
                         if not p["is_imposter"]:
@@ -562,43 +515,28 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                 self._add_chat(game, "System",
                     "Crew wins!" if game["result_banner"] == "crew" else "Imposters win!")
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # -------------------------------------------------------------- reset
     def _handle_reset(self):
-        """Back to lobby, keep same players and scores."""
         payload = self._read_json() or {}
-
         def run(game, token, payload):
             if token != game["host_token"]:
                 return self._json(403, {"error": "host_only"})
-            game["phase"] = "lobby"
-            game["round"] = 1
-            game["word"] = ""
-            game["imposter_hint"] = ""
-            game["imposter_count"] = 1
-            game["imposter_names"] = []
-            game["result_banner"] = ""
-            game["vote_counts"] = {}
-            game["voted_out_name"] = None
-            game["vote_tie"] = False
+            game["phase"] = "lobby"; game["round"] = 1
+            game["word"] = ""; game["imposter_hint"] = ""
+            game["imposter_count"] = 1; game["imposter_names"] = []
+            game["result_banner"] = ""; game["vote_counts"] = {}
+            game["voted_out_name"] = None; game["vote_tie"] = False
             game["chat_open"] = True
             for p in game["players"]:
-                p["clue"] = ""
-                p["clue_audio"] = None
-                p["vote"] = None
-                p["ready"] = False
-                p["is_imposter"] = False
-                p["role_word"] = ""
-                p["role_hint"] = ""
+                p["clue"] = ""; p["clue_audio"] = None; p["vote"] = None
+                p["ready"] = False; p["is_imposter"] = False
+                p["role_word"] = ""; p["role_hint"] = ""
             self._add_chat(game, "System", "New game ready — everyone, please ready up.")
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
     def _handle_end(self):
-        """Delete the game entirely. Host only. All other players lose the room."""
         payload = self._read_json() or {}
         code = (payload.get("code") or "").upper().strip()
         token = payload.get("token") or ""
@@ -611,11 +549,9 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             del GAMES[code]
         self._json(200, {"ok": True})
 
-    # --------------------------------------------------------------- chat
     def _handle_chat(self):
         payload = self._read_json() or {}
         text = payload.get("text") or ""
-
         def run(game, token, payload):
             if not game.get("chat_open", True):
                 return self._json(403, {"error": "chat_locked"})
@@ -624,15 +560,12 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "empty"})
             if len(text) > MAX_CHAT_LEN:
                 text = text[:MAX_CHAT_LEN]
-            # only allow chat in safe phases (not mid-clue-submission)
             if game["phase"] == "clue" and not (me["clue"] or me.get("clue_audio")):
                 return self._json(403, {"error": "chat_blocked_during_clue"})
             self._add_chat(game, me["name"], text)
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # -------------------------------------------------------------- leave
     def _handle_leave(self):
         payload = self._read_json() or {}
         code = (payload.get("code") or "").upper().strip()
@@ -646,28 +579,22 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True})
             game["players"].remove(me)
             self._add_chat(game, "System", f"{me['name']} left the room")
-            # host transfer
             if me["token"] == game["host_token"] and game["players"]:
                 game["host_token"] = game["players"][0]["token"]
                 self._add_chat(game, "System",
                     f"{game['players'][0]['name']} is now the host")
-            # empty game → delete
             if not game["players"]:
                 del GAMES[code]
-            # if enough players left → auto-reset to lobby
-            elif len(game["players"]) < 3 and game["phase"] not in ("lobby",):
+            elif len(game["players"]) < 3 and game["phase"] != "lobby":
                 game["phase"] = "lobby"
                 for p in game["players"]:
                     p["ready"] = False
-                self._add_chat(game, "System",
-                    "Not enough players — game reset to lobby")
+                self._add_chat(game, "System", "Not enough players — game reset to lobby")
         self._json(200, {"ok": True})
 
-    # --------------------------------------------------------------- kick
     def _handle_kick(self):
         payload = self._read_json() or {}
         target = payload.get("target") or ""
-
         def run(game, token, payload):
             if token != game["host_token"]:
                 return self._json(403, {"error": "host_only"})
@@ -681,19 +608,18 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             game["players"].remove(victim)
             self._add_chat(game, "System", f"{target} was removed by the host")
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
 
 # ===========================================================================
-# HTML (SPA)
+# HTML (SPA — now with mode selector + local game engine)
 # ===========================================================================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Imposter Word — Multiplayer</title>
+<title>Imposter Word — Online & Local</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -734,6 +660,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
   button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
   button.secondary { background: #334155; }
   button.danger { background: #b91c1c; }
+  button.big { padding: 24px 16px; font-size: 1.1rem; }
+  .mode-grid { display: grid; gap: 14px; margin-top: 20px; }
+  .mode-card {
+    background: rgba(30,41,59,0.9); border: 2px solid #475569;
+    border-radius: 16px; padding: 18px; cursor: pointer; text-align: left;
+    transition: border-color 0.15s, transform 0.1s;
+    color: #f8fafc;
+  }
+  .mode-card:hover { border-color: #6366f1; transform: translateY(-2px); }
+  .mode-card .icon { font-size: 2rem; margin-bottom: 6px; }
+  .mode-card .title { font-size: 1.15rem; font-weight: 700; margin-bottom: 4px; }
+  .mode-card .desc { font-size: 0.85rem; color: #94a3b8; line-height: 1.4; }
   .role-card { text-align: center; padding: 28px 16px; border-radius: 16px; margin-top: 14px; }
   .role-card.crew { background: rgba(34, 197, 94, 0.15); border: 1px solid rgba(34,197,94,0.4); }
   .role-card.imposter { background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239,68,68,0.4); }
@@ -788,6 +726,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .banner.imposter { background: rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.5); color:#fca5a5; }
   .banner.tie { background: rgba(253,224,71,0.12); border:1px solid rgba(253,224,71,0.45); color:#fde68a; }
 
+  /* ---------- pass device ---------- */
+  .pass-banner {
+    text-align: center; padding: 30px 20px;
+    background: linear-gradient(135deg, rgba(99,102,241,0.15), rgba(139,92,246,0.15));
+    border: 1px solid rgba(99,102,241,0.4); border-radius: 16px; margin-bottom: 16px;
+  }
+  .pass-banner .who { font-size: 1.5rem; font-weight: 700; color: #a5b4fc; margin-bottom: 8px; }
+  .pass-banner .msg { font-size: 0.95rem; color: #cbd5e1; line-height: 1.5; }
+
   /* ---------- audio recorder ---------- */
   .recorder {
     display: flex; align-items: center; gap: 12px;
@@ -799,13 +746,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: #dc2626; border: 2px solid #7f1d1d;
     color: white; font-size: 1.5rem; padding: 0; margin: 0;
     flex-shrink: 0; cursor: pointer;
-    transition: transform 0.1s;
   }
   .rec-btn:active { transform: scale(0.92); }
-  .rec-btn.recording {
-    background: #991b1b;
-    animation: pulse 1s infinite;
-  }
+  .rec-btn.recording { background: #991b1b; animation: pulse 1s infinite; }
   @keyframes pulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.7); }
     50% { box-shadow: 0 0 0 12px rgba(220,38,38,0); }
@@ -872,7 +815,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-top: 1px solid rgba(239,68,68,0.3);
   }
 
-  /* ---------- menu / reset ---------- */
+  /* ---------- menu ---------- */
   .menu-fab {
     position: fixed; bottom: 18px; left: 18px;
     width: 48px; height: 48px; border-radius: 50%;
@@ -898,15 +841,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .scoreboard h4 { font-size: 0.85rem; color: #94a3b8; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
   .score-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 0.9rem; }
   .score-row .pts { color: #86efac; font-weight: 700; }
+  .badge { display:inline-block; background:#4f46e5; padding:4px 10px; border-radius:999px; font-size:0.75rem; font-weight:600; }
+  .badge.local { background:#0d9488; }
 </style>
 </head>
 <body>
 <div class="app">
-  <h1>🕵️ Imposter Word</h1>
-  <p class="subtitle">Everyone on their own phone. Same word — except the imposters.</p>
+  <h1>🕵️ Imposter Word <span id="modeBadge" class="badge" style="display:none;"></span></h1>
+  <p class="subtitle">Same word — except the imposters.</p>
 
-  <!-- ===================== HOME ===================== -->
-  <div id="screen-home" class="screen active">
+  <!-- ===================== MODE SELECT ===================== -->
+  <div id="screen-mode" class="screen active">
+    <div class="mode-grid">
+      <div class="mode-card" onclick="pickMode('online')">
+        <div class="icon">🌐</div>
+        <div class="title">Play online</div>
+        <div class="desc">Each player on their own phone. Create a room or join with a code. Real-time chat.</div>
+      </div>
+      <div class="mode-card" onclick="pickMode('local')">
+        <div class="icon">📱</div>
+        <div class="title">Play on this phone</div>
+        <div class="desc">Pass one phone around. Everyone sees their role privately, then plays. No internet needed.</div>
+      </div>
+    </div>
+    <div class="small" id="resumeHint" style="display:none;">
+      <button class="secondary" onclick="resumeSession()" style="margin-top:16px;">Resume last online game</button>
+    </div>
+  </div>
+
+  <!-- ===================== ONLINE HOME ===================== -->
+  <div id="screen-home" class="screen">
+    <button class="secondary" onclick="backToMode()" style="width:auto;padding:8px 14px;font-size:0.85rem;margin:0 0 10px;">← Back</button>
     <label for="playerName">Your name</label>
     <input type="text" id="playerName" maxlength="20" placeholder="e.g. Rahul" autocomplete="off">
 
@@ -930,12 +895,40 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </select>
 
     <div id="homeError" class="error"></div>
-    <div class="small" id="resumeHint" style="display:none;">
-      <button class="secondary" onclick="resumeSession()" style="margin-top:8px;">Resume last game</button>
-    </div>
   </div>
 
-  <!-- ===================== LOBBY ===================== -->
+  <!-- ===================== LOCAL SETUP ===================== -->
+  <div id="screen-local-setup" class="screen">
+    <button class="secondary" onclick="backToMode()" style="width:auto;padding:8px 14px;font-size:0.85rem;margin:0 0 10px;">← Back</button>
+    <h2>📱 Play on this phone</h2>
+    <p class="subtitle">Enter the players, then pass the phone around.</p>
+
+    <label for="localLang">Language / भाषा</label>
+    <select id="localLang">
+      <option value="en">English</option>
+      <option value="hi">हिन्दी (Hindi)</option>
+    </select>
+
+    <label for="localNumPlayers">Number of players (3–10)</label>
+    <input type="text" id="localNumPlayers" value="4" inputmode="numeric" style="text-align:center;font-size:1.3rem;">
+
+    <div id="localNameInputs" style="margin-top:12px;"></div>
+
+    <div id="localImposterBox">
+      <label for="localNumImposters">Number of imposters</label>
+      <select id="localNumImposters">
+        <option value="1">1 imposter</option>
+        <option value="2">2 imposters</option>
+        <option value="3">3 imposters</option>
+      </select>
+      <div class="small" id="localImposterNote"></div>
+    </div>
+
+    <button onclick="startLocalGame()">▶ Start local game</button>
+    <div id="localError" class="error"></div>
+  </div>
+
+  <!-- ===================== LOBBY (ONLINE) ===================== -->
   <div id="screen-lobby" class="screen">
     <h2>Lobby</h2>
     <p class="subtitle">Scan the QR or share the code</p>
@@ -960,7 +953,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="small">Auto-updates every 1.5s.</div>
   </div>
 
-  <!-- ===================== REVEAL ===================== -->
+  <!-- ===================== PASS DEVICE (shared) ===================== -->
+  <div id="screen-pass" class="screen">
+    <div class="pass-banner">
+      <div class="who">👉 Pass to <span id="passWho">Player 1</span></div>
+      <div class="msg">Make sure nobody else is looking at the screen.</div>
+    </div>
+    <button class="big" onclick="revealRole()">I'm <span id="passWhoInline">Player 1</span> — show my role</button>
+  </div>
+
+  <!-- ===================== REVEAL (shared) ===================== -->
   <div id="screen-reveal" class="screen">
     <div class="round-header" id="revealRound">ROLE REVEAL</div>
     <h2>Your secret role</h2>
@@ -971,6 +973,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="role-hint" id="revealHint"></div>
     </div>
     <button onclick="hostAdvance()" id="revealNextBtn" style="display:none;">Everyone ready — go to clues →</button>
+    <button class="secondary" onclick="localHideAndContinue()" id="revealLocalBtn" style="display:none;">Hide &amp; continue</button>
     <div class="progress" id="revealProgress">Only the host can advance.</div>
   </div>
 
@@ -979,6 +982,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="round-header" id="clueRoundHeader">ROUND 1 — CLUES</div>
     <h2>Give your clue</h2>
     <p class="subtitle">Type a clue <em>or</em> record a voice note (max 10s).</p>
+    <div style="text-align:center;"><span class="badge" id="cluePlayerName">—</span></div>
 
     <label for="clueInput">Type your clue</label>
     <input type="text" id="clueInput" maxlength="80" placeholder="Type your clue..." autocomplete="off">
@@ -988,10 +992,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <div class="recorder" id="recorderBox">
       <button class="rec-btn" id="recBtn" onclick="toggleRecording()">🎙️</button>
-      <div class="rec-info" id="recInfo">
-        Tap the mic to record a voice clue.<br>
-        Max 10 seconds.
-      </div>
+      <div class="rec-info" id="recInfo">Tap the mic to record a voice clue.<br>Max 10 seconds.</div>
       <button class="rec-clear" id="recClearBtn" onclick="clearRecording()" style="display:none;">Clear</button>
     </div>
     <audio id="recPlayback" controls style="width:100%;margin-top:8px;display:none;"></audio>
@@ -1009,19 +1010,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <p class="subtitle">Read carefully. Tap ▶ to play voice clues.</p>
     <div id="summaryList" style="display:grid;gap:8px;margin-top:12px;"></div>
     <button onclick="hostAdvance()" id="summaryNextBtn" style="display:none;">Continue →</button>
-    <div class="progress">Waiting for the host...</div>
+    <div class="progress" id="summaryProgress">Waiting for the host...</div>
   </div>
 
   <!-- ===================== VOTE ===================== -->
   <div id="screen-vote" class="screen">
     <h2>Vote!</h2>
-    <p class="subtitle">Who is an imposter? Your vote is secret.</p>
+    <p class="subtitle">Who is an imposter?</p>
+    <div style="text-align:center;"><span class="badge" id="voteVoterName">—</span></div>
     <label>Your vote</label>
     <div id="voteList" class="vote-list"></div>
     <button id="voteSubmitBtn" onclick="submitVote()" disabled>Lock in vote</button>
     <div class="error" id="voteError"></div>
     <div class="players-list" id="voteWaitingList"></div>
-    <div class="small">💬 Use chat below to discuss while waiting.</div>
+    <div class="small" id="voteChatHint">💬 Use chat below to discuss while waiting.</div>
   </div>
 
   <!-- ===================== RESULT ===================== -->
@@ -1035,22 +1037,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <div id="imposterBox" style="margin-top:14px;text-align:center;"></div>
-
     <div class="scoreboard" id="scoreboard"></div>
-
     <div id="resultClues" style="margin-top:14px;"></div>
 
     <button onclick="playAgain()" id="playAgainBtn" style="display:none;">▶ Play again (same players)</button>
-    <div class="progress" id="resultProgress">Waiting for host...</div>
+    <button class="secondary" onclick="backToMode()">🏠 Back to menu</button>
+    <div class="progress" id="resultProgress"></div>
   </div>
 </div>
 
-<!-- ===================== CHAT FAB ===================== -->
+<!-- chat FAB -->
 <button class="chat-fab" id="chatFab" onclick="toggleChat()" style="display:none;">
   💬<span class="unread" id="chatUnread" style="display:none;">0</span>
 </button>
 
-<!-- ===================== CHAT PANEL ===================== -->
+<!-- chat panel -->
 <div class="chat-panel" id="chatPanel">
   <div class="chat-header">
     <h3>💬 Room chat</h3>
@@ -1064,10 +1065,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- ===================== MENU FAB ===================== -->
+<!-- menu FAB -->
 <button class="menu-fab" id="menuFab" onclick="toggleMenu()" style="display:none;">☰</button>
 
-<!-- ===================== MENU PANEL ===================== -->
+<!-- menu panel -->
 <div class="menu-panel" id="menuPanel">
   <div class="menu-card">
     <h3>Game menu</h3>
@@ -1083,20 +1084,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <script>
 // ============================================================================
-//  STATE
+//  GLOBAL STATE
 // ============================================================================
-const STORAGE_KEY = 'imposter_session_v4';
+const STORAGE_KEY = 'imposter_session_v5';
 let session = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
-let current = null;
+let current = null;              // current online state
 let pollTimer = null;
 let selectedVote = null;
 let chatOpen = false;
 let lastChatCount = 0;
+
+// shared recording state
 let mediaRecorder = null;
 let recordedChunks = [];
 let recordedAudioDataUrl = null;
 let recordTimer = null;
 let recordSeconds = 0;
+
+// ---------------------------------------------------------------------------
+// LOCAL GAME STATE — everything runs in the browser
+// ---------------------------------------------------------------------------
+let local = null;   // { word, imposterHint, imposterIndices, players: [...], round, ... }
 
 const $ = id => document.getElementById(id);
 const show = id => {
@@ -1115,6 +1123,11 @@ async function api(path, body) {
   if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
   return data;
 }
+async function apiGet(path) {
+  const res = await fetch('/api/' + path);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
 
 function saveSession(s) {
   session = s;
@@ -1123,7 +1136,34 @@ function saveSession(s) {
 }
 
 // ============================================================================
-//  HOME
+//  MODE SELECT
+// ============================================================================
+function pickMode(mode) {
+  if (mode === 'online') {
+    $('modeBadge').style.display = 'none';
+    show('screen-home');
+  } else {
+    $('modeBadge').style.display = 'inline-block';
+    $('modeBadge').textContent = '📱 LOCAL';
+    $('modeBadge').className = 'badge local';
+    initLocalSetup();
+    show('screen-local-setup');
+  }
+}
+function backToMode() {
+  stopPolling();
+  $('chatFab').style.display = 'none';
+  $('menuFab').style.display = 'none';
+  $('menuPanel').classList.remove('open');
+  $('chatPanel').classList.remove('open');
+  $('modeBadge').style.display = 'none';
+  // refresh resume hint
+  $('resumeHint').style.display = session ? 'block' : 'none';
+  show('screen-mode');
+}
+
+// ============================================================================
+//  ONLINE — HOME
 // ============================================================================
 function showJoin() {
   $('joinBox').style.display = 'block';
@@ -1166,11 +1206,11 @@ async function joinGame() {
 async function resumeSession() {
   if (!session) return;
   try { applyState(await api('state', session)); }
-  catch (e) { saveSession(null); err('That game no longer exists'); }
+  catch (e) { saveSession(null); $('resumeHint').style.display = 'none'; alert('That game no longer exists.'); }
 }
 
 // ============================================================================
-//  POLLING
+//  ONLINE — POLLING & ROUTER
 // ============================================================================
 function startPolling() {
   stopPolling();
@@ -1179,28 +1219,25 @@ function startPolling() {
     try { applyState(await api('state', session)); }
     catch (e) {
       if (e.message === 'game_not_found' || e.message === 'not_in_game') {
-        saveSession(null); stopPolling(); show('screen-home');
+        saveSession(null); stopPolling(); backToMode();
       }
     }
   }, 1500);
 }
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 
-// ============================================================================
-//  ROUTER
-// ============================================================================
 function applyState(s) {
   current = s;
+  $('modeBadge').style.display = 'none';   // online mode
   const p = s.phase;
   if (p === 'lobby')        renderLobby(s);
-  else if (p === 'reveal')  renderReveal(s);
+  else if (p === 'reveal')  renderRevealOnline(s);
   else if (p === 'clue')    renderClue(s);
   else if (p === 'summary') renderSummary(s);
-  else if (p === 'vote')    renderVote(s);
+  else if (p === 'vote')    renderVoteOnline(s);
   else if (p === 'result')  renderResult(s);
   updateChatBadge(s);
   if (chatOpen) renderChat(s);
-  // show menu FAB when in a game
   $('menuFab').style.display = 'flex';
   $('menuRoomCode').textContent = s.code;
   $('menuYouName').textContent = s.you ? s.you.name : '—';
@@ -1209,13 +1246,13 @@ function applyState(s) {
 }
 
 // ============================================================================
-//  LOBBY
+//  ONLINE — LOBBY
 // ============================================================================
 function renderLobby(s) {
   show('screen-lobby');
   $('lobbyCode').textContent = s.code;
   const joinUrl = location.origin + '/join?code=' + s.code;
-  $('qrWrap').innerHTML = `<img alt="QR to join" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(joinUrl)}">`;
+  $('qrWrap').innerHTML = `<img alt="QR" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(joinUrl)}">`;
   const list = $('lobbyPlayers');
   list.innerHTML = '';
   s.players.forEach(p => {
@@ -1246,9 +1283,7 @@ function renderLobby(s) {
     }
     sel.value = String(Math.min(s.imposter_count, Math.min(3, maxK)));
     $('imposterNote').textContent = `Max ${maxK} with ${n} players.`;
-  } else {
-    box.style.display = 'none';
-  }
+  } else box.style.display = 'none';
 
   if (s.is_host) {
     $('lobbyStartBtn').style.display = 'block';
@@ -1257,9 +1292,7 @@ function renderLobby(s) {
     $('lobbyStartBtn').textContent = n < 3
       ? `Need ${3 - n} more player(s)`
       : (allReady ? '▶ Start game' : 'Waiting for everyone to be ready');
-  } else {
-    $('lobbyStartBtn').style.display = 'none';
-  }
+  } else $('lobbyStartBtn').style.display = 'none';
   $('chatFab').style.display = 'flex';
 }
 
@@ -1268,7 +1301,6 @@ async function toggleReady() {
   try { applyState(await api('ready', { ...session, ready: !current.you.ready })); }
   catch (e) { $('lobbyError').textContent = e.message; }
 }
-
 async function startGame() {
   if (!session) return;
   $('lobbyError').textContent = '';
@@ -1276,18 +1308,17 @@ async function startGame() {
   try { applyState(await api('start', { ...session, num_imposters: k })); }
   catch (e) { $('lobbyError').textContent = e.message; }
 }
-
 async function kickPlayer(name) {
   if (!session) return;
-  if (!confirm(`Remove ${name} from the room?`)) return;
+  if (!confirm(`Remove ${name}?`)) return;
   try { applyState(await api('kick', { ...session, target: name })); }
   catch (e) { alert(e.message); }
 }
 
 // ============================================================================
-//  REVEAL
+//  ONLINE — REVEAL / CLUE / SUMMARY / VOTE / RESULT
 // ============================================================================
-function renderReveal(s) {
+function renderRevealOnline(s) {
   show('screen-reveal');
   const card = $('revealCard');
   const isImp = !!s.you_are_imposter;
@@ -1295,21 +1326,19 @@ function renderReveal(s) {
   $('revealLabel').textContent = isImp ? 'You are an IMPOSTER!' : 'Your word';
   $('revealWord').textContent = isImp ? '🤫' : (s.your_word || '—');
   $('revealHint').textContent = isImp
-    ? 'Hint: ' + (s.your_hint || '') + '\nBlend in — don\'t get caught!'
+    ? 'Hint: ' + (s.your_hint || '') + '\nBlend in!'
     : 'Describe it without saying the word!';
-  $('revealRound').textContent = `ROLE REVEAL — ${s.imposter_count} IMPOSTER${s.imposter_count>1?'S':''} HIDDEN`;
+  $('revealRound').textContent = `ROLE REVEAL — ${s.imposter_count} IMPOSTER${s.imposter_count>1?'S':''}`;
   $('revealNextBtn').style.display = s.is_host ? 'block' : 'none';
+  $('revealLocalBtn').style.display = 'none';
   $('chatFab').style.display = 'flex';
 }
-
-// ============================================================================
-//  CLUE + RECORDING
-// ============================================================================
-let clueAudioEl = null;
 
 function renderClue(s) {
   show('screen-clue');
   $('clueRoundHeader').textContent = `ROUND ${s.round} OF 2 — CLUES`;
+  $('cluePlayerName').textContent = s.you ? s.you.name : '—';
+  $('cluePlayerName').className = 'badge';
   const submitted = s.you.clue || s.you.clue_audio;
   $('clueInput').disabled = !!submitted;
   $('clueSubmitBtn').disabled = !!submitted;
@@ -1328,100 +1357,10 @@ function renderClue(s) {
   });
   const done = s.players.filter(p => p.has_clue).length;
   $('clueProgress').textContent = `${done} / ${s.players.length} submitted`;
-  $('chatFab').style.display = submitted ? 'flex' : 'none';  // chat unlocked after submit
+  $('chatFab').style.display = submitted ? 'flex' : 'none';
   if (chatOpen && submitted) renderChat(s);
 }
 
-async function toggleRecording() {
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    stopRecording();
-    return;
-  }
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    recordedChunks = [];
-    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-    mediaRecorder.ondataavailable = e => {
-      if (e.data.size > 0) recordedChunks.push(e.data);
-    };
-    mediaRecorder.onstop = async () => {
-      stream.getTracks().forEach(t => t.stop());
-      const blob = new Blob(recordedChunks, { type: 'audio/webm' });
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        recordedAudioDataUrl = reader.result;
-        $('recPlayback').src = recordedAudioDataUrl;
-        $('recPlayback').style.display = 'block';
-        $('voiceSubmitBtn').style.display = 'block';
-        $('recClearBtn').style.display = 'block';
-      };
-      reader.readAsDataURL(blob);
-    };
-    mediaRecorder.start();
-    recordedAudioDataUrl = null;
-    $('recPlayback').style.display = 'none';
-    $('voiceSubmitBtn').style.display = 'none';
-    $('recClearBtn').style.display = 'none';
-    $('recBtn').classList.add('recording');
-    $('recBtn').textContent = '⏹';
-    recordSeconds = 0;
-    $('recInfo').innerHTML = `Recording... <span class="rec-timer">0.0s</span> / 10s`;
-    recordTimer = setInterval(() => {
-      recordSeconds += 0.1;
-      $('recInfo').innerHTML = `Recording... <span class="rec-timer">${recordSeconds.toFixed(1)}s</span> / 10s`;
-      if (recordSeconds >= 10) stopRecording();
-    }, 100);
-  } catch (e) {
-    $('clueError').textContent = 'Mic permission denied or unavailable.';
-  }
-}
-
-function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    mediaRecorder.stop();
-  }
-  clearInterval(recordTimer);
-  $('recBtn').classList.remove('recording');
-  $('recBtn').textContent = '🎙️';
-  $('recInfo').innerHTML = 'Recorded! Tap ▶ to preview, or Clear to redo.';
-}
-
-function clearRecording() {
-  recordedAudioDataUrl = null;
-  $('recPlayback').style.display = 'none';
-  $('recPlayback').src = '';
-  $('voiceSubmitBtn').style.display = 'none';
-  $('recClearBtn').style.display = 'none';
-  $('recInfo').innerHTML = 'Tap the mic to record a voice clue.<br>Max 10 seconds.';
-}
-
-async function submitClue() {
-  if (!session) return;
-  $('clueError').textContent = '';
-  const text = $('clueInput').value.trim();
-  if (!text) { $('clueError').textContent = 'Please type a clue.'; return; }
-  try { applyState(await api('clue', { ...session, text })); }
-  catch (e) {
-    const m = { contains_word: '❌ Your clue contains the secret word!' };
-    $('clueError').textContent = m[e.message] || e.message;
-  }
-}
-
-async function submitVoice() {
-  if (!session || !recordedAudioDataUrl) return;
-  $('clueError').textContent = '';
-  try {
-    applyState(await api('audio', { ...session, audio: recordedAudioDataUrl }));
-    clearRecording();
-  } catch (e) {
-    const m = { audio_too_large: 'Recording too large. Try a shorter clip.' };
-    $('clueError').textContent = m[e.message] || e.message;
-  }
-}
-
-// ============================================================================
-//  SUMMARY
-// ============================================================================
 function renderSummary(s) {
   show('screen-summary');
   $('summaryHeader').textContent = `ROUND ${s.round} COMPLETE`;
@@ -1430,42 +1369,23 @@ function renderSummary(s) {
   s.players.forEach(p => {
     const d = document.createElement('div');
     d.className = 'clue-item' + (p.name === s.you.name ? ' mine' : '');
-    if (p.clue) {
-      d.innerHTML = `<span class="name">${esc(p.name)}:</span> ${esc(p.clue)}`;
-    } else if (p.clue_audio) {
-      d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ voice clue
-        <button class="play-btn" onclick="playAudio('${p.clue_audio}')">▶ Play</button>`;
-    } else {
-      d.innerHTML = `<span class="name">${esc(p.name)}:</span> —`;
-    }
+    if (p.clue) d.innerHTML = `<span class="name">${esc(p.name)}:</span> ${esc(p.clue)}`;
+    else if (p.clue_audio) d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ voice
+      <button class="play-btn" onclick="playAudio('${p.clue_audio}')">▶ Play</button>`;
+    else d.innerHTML = `<span class="name">${esc(p.name)}:</span> —`;
     list.appendChild(d);
   });
   const btn = $('summaryNextBtn');
   if (s.is_host) {
     btn.style.display = 'block';
     btn.textContent = s.round === 1 ? 'Start Round 2 →' : 'Go to voting →';
-  } else {
-    btn.style.display = 'none';
-  }
+  } else btn.style.display = 'none';
   $('chatFab').style.display = 'flex';
 }
 
-function playAudio(dataUrl) {
-  const a = new Audio(dataUrl);
-  a.play().catch(() => alert('Tap again to play'));
-}
-
-async function hostAdvance() {
-  if (!session) return;
-  try { applyState(await api('advance', session)); }
-  catch (e) { alert(e.message); }
-}
-
-// ============================================================================
-//  VOTE
-// ============================================================================
-function renderVote(s) {
+function renderVoteOnline(s) {
   show('screen-vote');
+  $('voteVoterName').textContent = s.you ? s.you.name : '—';
   const voted = s.you.has_voted;
   if (voted) selectedVote = null;
   $('voteSubmitBtn').disabled = !selectedVote || voted;
@@ -1495,22 +1415,10 @@ function renderVote(s) {
     d.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${p.has_voted ? '✅ voted' : '⏳ waiting'}</span>`;
     wl.appendChild(d);
   });
+  $('voteChatHint').style.display = 'block';
   $('chatFab').style.display = 'flex';
 }
 
-async function submitVote() {
-  if (!session || !selectedVote) return;
-  $('voteError').textContent = '';
-  try {
-    const r = await api('vote', { ...session, target: selectedVote });
-    selectedVote = null;
-    applyState(r);
-  } catch (e) { $('voteError').textContent = e.message; }
-}
-
-// ============================================================================
-//  RESULT
-// ============================================================================
 function renderResult(s) {
   show('screen-result');
   const imposterNames = s.imposter_names || [];
@@ -1547,13 +1455,13 @@ function renderResult(s) {
     `<div class="round-header">IMPOSTER${imposterNames.length>1?'S':''}</div>` +
     imposterNames.map(n => `<span class="imposter-pill">🕵️ ${esc(n)}</span>`).join(' ');
 
-  const sb = $('scoreboard');
   const scores = s.scores || {};
   const sortedScores = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  const sb = $('scoreboard');
   if (sortedScores.length) {
     sb.innerHTML = '<h4>🏆 Session scores</h4>' +
       sortedScores.map(([n, v]) => `<div class="score-row"><span>${esc(n)}</span><span class="pts">${v} win${v===1?'':'s'}</span></div>`).join('');
-  }
+  } else sb.innerHTML = '';
 
   const rc = $('resultClues');
   rc.innerHTML = '<div class="round-header">ROUND 2 CLUES</div>';
@@ -1568,7 +1476,7 @@ function renderResult(s) {
   });
 
   $('playAgainBtn').style.display = s.is_host ? 'block' : 'none';
-  $('resultProgress').textContent = s.is_host ? '' : 'Waiting for host to start a new round...';
+  $('resultProgress').textContent = s.is_host ? '' : 'Waiting for host...';
   $('chatFab').style.display = 'flex';
 }
 
@@ -1578,8 +1486,550 @@ async function playAgain() {
   catch (e) { alert(e.message); }
 }
 
+// online actions
+async function hostAdvance() {
+  if (local) return localAdvance();
+  if (!session) return;
+  try { applyState(await api('advance', session)); }
+  catch (e) { alert(e.message); }
+}
+async function submitClue() {
+  if (local) return localSubmitClue('text');
+  if (!session) return;
+  $('clueError').textContent = '';
+  const text = $('clueInput').value.trim();
+  if (!text) { $('clueError').textContent = 'Please type a clue.'; return; }
+  try { applyState(await api('clue', { ...session, text })); }
+  catch (e) {
+    const m = { contains_word: '❌ Your clue contains the secret word!' };
+    $('clueError').textContent = m[e.message] || e.message;
+  }
+}
+async function submitVoice() {
+  if (local) return localSubmitClue('voice');
+  if (!session || !recordedAudioDataUrl) return;
+  $('clueError').textContent = '';
+  try {
+    applyState(await api('audio', { ...session, audio: recordedAudioDataUrl }));
+    clearRecording();
+  } catch (e) {
+    const m = { audio_too_large: 'Recording too large. Try a shorter clip.' };
+    $('clueError').textContent = m[e.message] || e.message;
+  }
+}
+async function submitVote() {
+  if (local) return localSubmitVote();
+  if (!session || !selectedVote) return;
+  $('voteError').textContent = '';
+  try {
+    const r = await api('vote', { ...session, target: selectedVote });
+    selectedVote = null;
+    applyState(r);
+  } catch (e) { $('voteError').textContent = e.message; }
+}
+
+function playAudio(dataUrl) {
+  const a = new Audio(dataUrl);
+  a.play().catch(() => alert('Tap again to play'));
+}
+
 // ============================================================================
-//  CHAT
+//  LOCAL MODE — SETUP
+// ============================================================================
+let localNames = ['', '', '', ''];
+
+function initLocalSetup() {
+  $('localError').textContent = '';
+  $('localNumPlayers').value = '4';
+  $('localLang').value = 'en';
+  $('localNumImposters').value = '1';
+  renderLocalNameInputs();
+  $('localImposterNote').textContent = 'Max 1 with 3 players.';
+}
+
+function renderLocalNameInputs() {
+  const n = Math.max(3, Math.min(10, parseInt($('localNumPlayers').value, 10) || 4));
+  // resize names
+  while (localNames.length < n) localNames.push('');
+  localNames = localNames.slice(0, n);
+
+  const box = $('localNameInputs');
+  box.innerHTML = '';
+  for (let i = 0; i < n; i++) {
+    const label = document.createElement('label');
+    label.textContent = `Player ${i + 1}`;
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.maxLength = 20;
+    inp.value = localNames[i] || `Player ${i + 1}`;
+    inp.placeholder = `Player ${i + 1}`;
+    inp.oninput = () => { localNames[i] = inp.value; };
+    localNames[i] = inp.value;
+    box.appendChild(label);
+    box.appendChild(inp);
+  }
+
+  // imposter select
+  const maxK = Math.max(1, Math.floor((n - 1) / 2));
+  const sel = $('localNumImposters');
+  sel.innerHTML = '';
+  for (let k = 1; k <= Math.min(3, maxK); k++) {
+    const opt = document.createElement('option');
+    opt.value = k; opt.textContent = k + ' imposter' + (k > 1 ? 's' : '');
+    sel.appendChild(opt);
+  }
+  sel.value = String(Math.min(parseInt(sel.value, 10) || 1, Math.min(3, maxK)));
+  $('localImposterNote').textContent = `Max ${maxK} with ${n} players.`;
+}
+
+$('localNumPlayers').addEventListener('input', renderLocalNameInputs);
+
+let localWordCache = null;
+async function ensureWordCache() {
+  if (localWordCache) return localWordCache;
+  try {
+    const r = await apiGet('words');
+    localWordCache = r.words;
+  } catch (e) {
+    // fallback: minimal word list if server offline
+    localWordCache = [
+      {"en": {"word": "Pizza", "imposter_hint": "Round food cut into slices."},
+       "hi": {"word": "पिज़्ज़ा", "imposter_hint": "गोल खाना।"}},
+      {"en": {"word": "Car", "imposter_hint": "Four wheels."},
+       "hi": {"word": "कार", "imposter_hint": "चार पहिये।"}},
+      {"en": {"word": "Dog", "imposter_hint": "A loyal pet."},
+       "hi": {"word": "कुत्ता", "imposter_hint": "वफादार पालतू।"}},
+    ];
+  }
+  return localWordCache;
+}
+
+async function startLocalGame() {
+  $('localError').textContent = '';
+  const n = Math.max(3, Math.min(10, parseInt($('localNumPlayers').value, 10) || 4));
+  const names = localNames.slice(0, n).map((s, i) => (s || '').trim() || `Player ${i + 1}`);
+  // duplicate check
+  const lower = names.map(s => s.toLowerCase());
+  if (new Set(lower).size !== lower.length) {
+    $('localError').textContent = 'Player names must be unique.';
+    return;
+  }
+  const lang = $('localLang').value;
+  const k = parseInt($('localNumImposters').value, 10) || 1;
+  const maxK = Math.max(1, Math.floor((n - 1) / 2));
+  const numImposters = Math.max(1, Math.min(k, maxK));
+
+  let bank;
+  try { bank = await ensureWordCache(); }
+  catch (e) { $('localError').textContent = 'Could not load words.'; return; }
+
+  const entry = bank[Math.floor(Math.random() * bank.length)][lang];
+  const imposterIndices = new Set();
+  while (imposterIndices.size < numImposters) {
+    imposterIndices.add(Math.floor(Math.random() * n));
+  }
+
+  local = {
+    lang,
+    word: entry.word,
+    imposterHint: entry.imposter_hint,
+    imposterIndices: [...imposterIndices].sort((a,b)=>a-b),
+    numImposters,
+    players: names.map((name, i) => ({
+      name,
+      isImposter: imposterIndices.has(i),
+      clue: '', clueAudio: null, vote: null, score: 0,
+    })),
+    round: 1,
+    phase: 'pass',
+    // pass-and-play control
+    passIndex: 0,       // which player is receiving the phone for reveal
+    clueIndex: 0,       // which player is giving a clue
+    voteIndex: 0,       // which player is voting
+    revealed: false,    // role currently visible?
+    selectedVote: null,
+    chatLog: [],        // local mode "chat" = system log
+  };
+  localRenderPass();
+}
+
+// ============================================================================
+//  LOCAL — PASS & REVEAL
+// ============================================================================
+function localRenderPass() {
+  const p = local.players[local.passIndex];
+  $('passWho').textContent = p.name;
+  $('passWhoInline').textContent = p.name;
+  show('screen-pass');
+}
+
+function revealRole() {
+  if (!local) return;
+  const p = local.players[local.passIndex];
+  const isImp = p.isImposter;
+  const card = $('revealCard');
+  card.className = 'role-card ' + (isImp ? 'imposter' : 'crew');
+  $('revealLabel').textContent = isImp ? 'You are an IMPOSTER!' : 'Your word';
+  $('revealWord').textContent = isImp ? '🤫' : (local.word || '—');
+  $('revealHint').textContent = isImp
+    ? 'Hint: ' + (local.imposterHint || '') + '\nBlend in!'
+    : 'Describe it without saying the word!';
+  $('revealRound').textContent = `ROLE REVEAL — ${local.numImposters} IMPOSTER${local.numImposters>1?'S':''}`;
+  $('revealNextBtn').style.display = 'none';
+  $('revealLocalBtn').style.display = 'block';
+  $('revealProgress').textContent = `Player ${local.passIndex + 1} of ${local.players.length}`;
+  show('screen-reveal');
+}
+
+function localHideAndContinue() {
+  local.passIndex++;
+  if (local.passIndex < local.players.length) {
+    localRenderPass();
+  } else {
+    // all seen — start round 1 clues
+    local.phase = 'clue';
+    local.round = 1;
+    local.clueIndex = 0;
+    localRenderClue();
+  }
+}
+
+// ============================================================================
+//  LOCAL — CLUES
+// ============================================================================
+function localRenderClue() {
+  clearRecording();
+  $('clueRoundHeader').textContent = `ROUND ${local.round} OF 2 — CLUES`;
+  const p = local.players[local.clueIndex];
+  $('cluePlayerName').textContent = p.name;
+  $('clueInput').value = '';
+  $('clueInput').disabled = false;
+  $('clueSubmitBtn').disabled = false;
+  $('clueSubmitBtn').textContent = 'Submit written clue';
+  $('voiceSubmitBtn').style.display = 'none';
+  $('clueError').textContent = '';
+
+  // show all clues already given this round
+  const wl = $('clueWaitingList');
+  wl.innerHTML = '';
+  local.players.forEach((pl, i) => {
+    const d = document.createElement('div');
+    d.className = 'player-row';
+    let status = '⏳ waiting';
+    if (pl.clue || pl.clueAudio) status = '✅ done';
+    else if (i === local.clueIndex) status = '✏️ your turn';
+    d.innerHTML = `<span>${esc(pl.name)}</span><span class="tag">${status}</span>`;
+    wl.appendChild(d);
+  });
+  const done = local.players.filter(pl => pl.clue || pl.clueAudio).length;
+  $('clueProgress').textContent = `${done} / ${local.players.length} submitted`;
+  $('chatFab').style.display = 'none';
+  show('screen-clue');
+  setTimeout(() => $('clueInput').focus(), 100);
+}
+
+function localSubmitClue(kind) {
+  const p = local.players[local.clueIndex];
+  $('clueError').textContent = '';
+  if (kind === 'text') {
+    const text = $('clueInput').value.trim();
+    if (!text) { $('clueError').textContent = 'Please type a clue.'; return; }
+    if (local.word && local.word.toLowerCase() in text.toLowerCase()) {
+      // simple check
+      if (text.toLowerCase().includes(local.word.toLowerCase())) {
+        $('clueError').textContent = '❌ Your clue contains the secret word!';
+        return;
+      }
+    }
+    p.clue = text;
+    p.clueAudio = null;
+  } else {
+    if (!recordedAudioDataUrl) { $('clueError').textContent = 'No recording yet.'; return; }
+    p.clue = '';
+    p.clueAudio = recordedAudioDataUrl;
+    clearRecording();
+  }
+  local.clueIndex++;
+  if (local.clueIndex < local.players.length) {
+    localRenderClue();
+  } else {
+    local.phase = 'summary';
+    localRenderSummary();
+  }
+}
+
+// ============================================================================
+//  LOCAL — SUMMARY
+// ============================================================================
+function localRenderSummary() {
+  $('summaryHeader').textContent = `ROUND ${local.round} COMPLETE`;
+  const list = $('summaryList');
+  list.innerHTML = '';
+  local.players.forEach(p => {
+    const d = document.createElement('div');
+    d.className = 'clue-item';
+    if (p.clue) d.innerHTML = `<span class="name">${esc(p.name)}:</span> ${esc(p.clue)}`;
+    else if (p.clueAudio) d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ voice
+      <button class="play-btn" onclick="playAudio('${p.clueAudio}')">▶ Play</button>`;
+    else d.innerHTML = `<span class="name">${esc(p.name)}:</span> —`;
+    list.appendChild(d);
+  });
+  $('summaryNextBtn').style.display = 'block';
+  $('summaryNextBtn').textContent = local.round === 1 ? 'Start Round 2 →' : 'Go to voting →';
+  show('screen-summary');
+  $('chatFab').style.display = 'none';
+}
+
+function localAdvance() {
+  if (local.phase === 'summary') {
+    if (local.round === 1) {
+      local.round = 2;
+      local.clueIndex = 0;
+      local.players.forEach(p => { p.clue = ''; p.clueAudio = null; });
+      local.phase = 'clue';
+      localRenderClue();
+    } else {
+      local.phase = 'vote';
+      local.voteIndex = 0;
+      local.players.forEach(p => { p.vote = null; });
+      localRenderVote();
+    }
+  }
+}
+
+// ============================================================================
+//  LOCAL — VOTE
+// ============================================================================
+function localRenderVote() {
+  const voter = local.players[local.voteIndex];
+  $('voteVoterName').textContent = voter.name;
+  local.selectedVote = null;
+  $('voteSubmitBtn').disabled = true;
+  $('voteSubmitBtn').textContent = 'Lock in vote';
+  $('voteError').textContent = '';
+
+  const list = $('voteList');
+  list.innerHTML = '';
+  local.players.forEach((p, i) => {
+    if (i === local.voteIndex) return;
+    const btn = document.createElement('button');
+    btn.className = 'vote-btn';
+    btn.textContent = p.name;
+    btn.onclick = () => {
+      local.selectedVote = p.name;
+      document.querySelectorAll('.vote-btn').forEach(b => b.classList.remove('selected'));
+      btn.classList.add('selected');
+      $('voteSubmitBtn').disabled = false;
+    };
+    list.appendChild(btn);
+  });
+
+  const wl = $('voteWaitingList');
+  wl.innerHTML = '';
+  local.players.forEach((p, i) => {
+    const d = document.createElement('div');
+    d.className = 'player-row';
+    let status = '⏳ waiting';
+    if (p.vote) status = '✅ voted';
+    else if (i === local.voteIndex) status = '✏️ your turn';
+    d.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${status}</span>`;
+    wl.appendChild(d);
+  });
+  $('voteChatHint').style.display = 'none';
+  $('chatFab').style.display = 'none';
+  show('screen-vote');
+}
+
+function localSubmitVote() {
+  if (!local.selectedVote) return;
+  local.players[local.voteIndex].vote = local.selectedVote;
+  local.voteIndex++;
+  if (local.voteIndex < local.players.length) {
+    localRenderVote();
+  } else {
+    localResolveVotes();
+  }
+}
+
+function localResolveVotes() {
+  const counts = {};
+  local.players.forEach(p => counts[p.name] = 0);
+  local.players.forEach(p => { if (p.vote in counts) counts[p.vote]++; });
+  const top = Math.max(...Object.values(counts));
+  const leaders = Object.entries(counts).filter(([, c]) => c === top && c > 0).map(([n]) => n);
+  const tie = leaders.length > 1;
+  const votedOut = tie ? null : leaders[0];
+  const imposterNames = local.players.filter(p => p.isImposter).map(p => p.name);
+  let banner;
+  if (tie) banner = 'imposter';
+  else if (imposterNames.includes(votedOut)) banner = imposterNames.length === 1 ? 'crew' : 'imposter';
+  else banner = 'imposter';
+
+  // scoring
+  if (banner === 'crew') local.players.forEach(p => { if (!p.isImposter) p.score++; });
+  else local.players.forEach(p => { if (p.isImposter) p.score++; });
+
+  localResult = { counts, tie, votedOut, imposterNames, banner };
+  localRenderResult();
+}
+
+let localResult = null;
+
+function localRenderResult() {
+  const { counts, tie, votedOut, imposterNames, banner } = localResult;
+  $('resultBanner').textContent =
+    banner === 'crew' ? '🎉 CREW WINS!' :
+    banner === 'imposter' ? '😈 IMPOSTERS WIN!' : '🤝 TIE';
+  $('resultBanner').className = 'banner ' + banner;
+
+  let detail = '';
+  if (tie) detail += 'The vote was a tie.<br>';
+  else if (votedOut) detail += `Voted out: <strong>${esc(votedOut)}</strong>.<br>`;
+  detail += `Imposter${imposterNames.length>1?'s':''}: ` +
+    imposterNames.map(n => `<strong>${esc(n)}</strong>`).join(', ') +
+    `<br>Secret word: <strong>${esc(local.word)}</strong>.`;
+  $('resultDetail').innerHTML = detail;
+
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const topCount = entries.length ? entries[0][1] : 0;
+  $('voteSummary').innerHTML = entries.map(([n, c]) =>
+    `<div class="vote-row ${c === topCount && c > 0 && !tie ? 'top' : ''}">
+       <span>${esc(n)}${imposterNames.includes(n) ? ' 🤫' : ''}</span>
+       <span class="count">${c} vote${c === 1 ? '' : 's'}</span></div>`
+  ).join('');
+
+  $('imposterBox').innerHTML =
+    `<div class="round-header">IMPOSTER${imposterNames.length>1?'S':''}</div>` +
+    imposterNames.map(n => `<span class="imposter-pill">🕵️ ${esc(n)}</span>`).join(' ');
+
+  const sorted = [...local.players].sort((a, b) => b.score - a.score);
+  $('scoreboard').innerHTML = '<h4>🏆 Session scores</h4>' +
+    sorted.map(p => `<div class="score-row"><span>${esc(p.name)}</span><span class="pts">${p.score} win${p.score===1?'':'s'}</span></div>`).join('');
+
+  $('resultClues').innerHTML = '<div class="round-header">ROUND 2 CLUES</div>' +
+    local.players.map(p =>
+      p.clue ? `<div class="clue-item"><span class="name">${esc(p.name)}:</span> ${esc(p.clue)}</div>` :
+      p.clueAudio ? `<div class="clue-item"><span class="name">${esc(p.name)}:</span> 🎙️ voice
+        <button class="play-btn" onclick="playAudio('${p.clueAudio}')">▶ Play</button></div>` :
+      `<div class="clue-item"><span class="name">${esc(p.name)}:</span> —</div>`
+    ).join('');
+
+  $('playAgainBtn').style.display = 'block';
+  $('playAgainBtn').onclick = () => {
+    // same players, new roles, keep scores
+    const names = local.players.map(p => p.name);
+    localNames = names;
+    startLocalGameWithScores(local.players.map(p => p.score));
+  };
+  $('resultProgress').textContent = '';
+  show('screen-result');
+}
+
+function startLocalGameWithScores(scores) {
+  // regenerate roles/word with same players, preserving scores
+  const n = local.players.length;
+  const lang = local.lang;
+  const numImposters = local.numImposters;
+  let bank = localWordCache || [];
+  const entry = bank[Math.floor(Math.random() * bank.length)][lang];
+  const imposterIndices = new Set();
+  while (imposterIndices.size < numImposters) {
+    imposterIndices.add(Math.floor(Math.random() * n));
+  }
+  local = {
+    lang,
+    word: entry.word,
+    imposterHint: entry.imposter_hint,
+    imposterIndices: [...imposterIndices],
+    numImposters,
+    players: local.players.map((p, i) => ({
+      name: p.name,
+      isImposter: imposterIndices.has(i),
+      clue: '', clueAudio: null, vote: null,
+      score: scores[i] || p.score || 0,
+    })),
+    round: 1, phase: 'pass',
+    passIndex: 0, clueIndex: 0, voteIndex: 0,
+    revealed: false, selectedVote: null,
+  };
+  localRenderPass();
+}
+
+// ============================================================================
+//  RECORDER (shared by online + local)
+// ============================================================================
+function pickMimeType() {
+  if (!window.MediaRecorder) return '';
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'];
+  for (const t of candidates) {
+    if (MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';
+}
+
+async function toggleRecording() {
+  if (mediaRecorder && mediaRecorder.state === 'recording') return stopRecording();
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $('clueError').textContent = 'Recording not supported on this browser.';
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recordedChunks = [];
+    const mime = pickMimeType();
+    mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
+    mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        recordedAudioDataUrl = reader.result;
+        $('recPlayback').src = recordedAudioDataUrl;
+        $('recPlayback').style.display = 'block';
+        $('voiceSubmitBtn').style.display = 'block';
+        $('recClearBtn').style.display = 'block';
+      };
+      reader.readAsDataURL(blob);
+    };
+    mediaRecorder.start();
+    recordedAudioDataUrl = null;
+    $('recPlayback').style.display = 'none';
+    $('voiceSubmitBtn').style.display = 'none';
+    $('recClearBtn').style.display = 'none';
+    $('recBtn').classList.add('recording');
+    $('recBtn').textContent = '⏹';
+    recordSeconds = 0;
+    $('recInfo').innerHTML = `Recording... <span class="rec-timer">0.0s</span> / 10s`;
+    recordTimer = setInterval(() => {
+      recordSeconds += 0.1;
+      $('recInfo').innerHTML = `Recording... <span class="rec-timer">${recordSeconds.toFixed(1)}s</span> / 10s`;
+      if (recordSeconds >= 10) stopRecording();
+    }, 100);
+  } catch (e) {
+    $('clueError').textContent = 'Mic permission denied or unavailable.';
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+  clearInterval(recordTimer);
+  $('recBtn').classList.remove('recording');
+  $('recBtn').textContent = '🎙️';
+  $('recInfo').innerHTML = 'Recorded! Tap ▶ to preview, or Clear to redo.';
+}
+
+function clearRecording() {
+  recordedAudioDataUrl = null;
+  $('recPlayback').style.display = 'none';
+  $('recPlayback').src = '';
+  $('voiceSubmitBtn').style.display = 'none';
+  $('recClearBtn').style.display = 'none';
+  $('recInfo').innerHTML = 'Tap the mic to record a voice clue.<br>Max 10 seconds.';
+}
+
+// ============================================================================
+//  CHAT (online only)
 // ============================================================================
 function toggleChat() {
   chatOpen = !chatOpen;
@@ -1590,19 +2040,16 @@ function toggleChat() {
     setTimeout(() => $('chatInput').focus(), 100);
   }
 }
-
 function updateChatBadge(s) {
   if (!s.chat) return;
   const newCount = s.chat.length;
   if (newCount > lastChatCount && !chatOpen) {
-    const diff = newCount - lastChatCount;
     const badge = $('chatUnread');
-    badge.textContent = diff;
+    badge.textContent = newCount - lastChatCount;
     badge.style.display = 'flex';
   }
   lastChatCount = newCount;
 }
-
 function renderChat(s) {
   const box = $('chatMessages');
   if (!box) return;
@@ -1618,65 +2065,45 @@ function renderChat(s) {
     box.appendChild(d);
   });
   if (atBottom) box.scrollTop = box.scrollHeight;
-  // chat lock
   const locked = s.phase === 'clue' && !(s.you && (s.you.clue || s.you.clue_audio));
   $('chatLocked').style.display = locked ? 'block' : 'none';
   $('chatInputRow').style.display = locked ? 'none' : 'flex';
 }
-
 async function sendChat() {
-  if (!session) return;
+  if (!session || local) return;
   const input = $('chatInput');
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
   try { applyState(await api('chat', { ...session, text })); }
   catch (e) {
-    const m = {
-      chat_locked: 'Chat is locked right now.',
-      chat_blocked_during_clue: 'Submit your clue first!'
-    };
+    const m = { chat_locked: 'Chat is locked.', chat_blocked_during_clue: 'Submit your clue first!' };
     alert(m[e.message] || e.message);
   }
 }
 
 // ============================================================================
-//  MENU / LEAVE / END
+//  MENU / LEAVE / END (online only)
 // ============================================================================
-function toggleMenu() {
-  $('menuPanel').classList.toggle('open');
-}
-
+function toggleMenu() { $('menuPanel').classList.toggle('open'); }
 async function leaveGame() {
   if (!session) return;
-  if (!confirm('Leave this game? You cannot rejoin without the code.')) return;
+  if (!confirm('Leave this game?')) return;
   try { await api('leave', session); } catch (e) {}
-  saveSession(null);
-  stopPolling();
-  $('chatFab').style.display = 'none';
-  $('menuFab').style.display = 'none';
-  $('menuPanel').classList.remove('open');
-  show('screen-home');
-  err('You left the game.');
+  saveSession(null); stopPolling(); backToMode();
 }
-
 async function endGame() {
   if (!session) return;
-  if (!confirm('End game for everyone? All players will be kicked out.')) return;
+  if (!confirm('End game for everyone?')) return;
   try { await api('end', session); } catch (e) {}
-  saveSession(null);
-  stopPolling();
-  $('chatFab').style.display = 'none';
-  $('menuFab').style.display = 'none';
-  $('menuPanel').classList.remove('open');
-  show('screen-home');
-  err('Game ended.');
+  saveSession(null); stopPolling(); backToMode();
 }
 
 // ============================================================================
 //  BOOT
 // ============================================================================
 (async function boot() {
+  // refresh resume hint
   if (session) {
     $('resumeHint').style.display = 'block';
     $('playerName').value = session.name || '';
@@ -1684,8 +2111,12 @@ async function endGame() {
     catch (e) { saveSession(null); }
   }
   const params = new URLSearchParams(location.search);
-  if (params.get('code')) showJoin();
-  show('screen-home');
+  if (params.get('code')) {
+    show('screen-home');
+    showJoin();
+  } else {
+    show('screen-mode');
+  }
 })();
 
 $('playerName').addEventListener('keydown', e => { if (e.key === 'Enter') $('joinCode').focus(); });
@@ -1712,13 +2143,13 @@ class ThreadingServer(socketserver.ThreadingTCPServer):
 
 
 def _graceful_shutdown(sig, frame):
-    print("\n[SHUTDOWN] Cleaning up...")
+    print("\n[SHUTDOWN]")
     sys.exit(0)
 
 
 def main():
     signal.signal(signal.SIGTERM, _graceful_shutdown)
-    print(f"[BOOT] Imposter Word on port {PORT} | RENDER={os.environ.get('RENDER', 'no')}")
+    print(f"[BOOT] port={PORT} RENDER={os.environ.get('RENDER', 'no')}")
     with ThreadingServer(("0.0.0.0", PORT), GameHandler) as httpd:
         print(f"[BOOT] Listening on 0.0.0.0:{PORT}")
         if not os.environ.get("RENDER"):
