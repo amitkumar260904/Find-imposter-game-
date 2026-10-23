@@ -122,7 +122,7 @@ WORD_BANK = [
 ]
 
 # ===========================================================================
-# STATE
+# STATE & HELPERS
 # ===========================================================================
 GAMES = {}
 GAMES_LOCK = threading.Lock()
@@ -131,14 +131,12 @@ MAX_VOICE_BYTES = 60_000
 MAX_CHAT_LEN = 200
 MAX_CHAT_HISTORY = 200
 
-
 def _cleanup_stale_games():
     now = time.time()
     with GAMES_LOCK:
         stale = [c for c, g in GAMES.items() if now - g["last_activity"] > GAME_TTL_SECONDS]
         for c in stale:
             del GAMES[c]
-
 
 def _new_code():
     alphabet = string.ascii_uppercase + string.digits
@@ -147,7 +145,6 @@ def _new_code():
         if code not in GAMES:
             return code
 
-
 def _make_player(token, name):
     return {
         "token": token, "name": name, "joined_at": time.time(),
@@ -155,7 +152,6 @@ def _make_player(token, name):
         "clue": "", "clue_audio": None, "vote": None, "ready": False,
         "score": 0,
     }
-
 
 def _tally_votes(game):
     counts = {p["name"]: 0 for p in game["players"]}
@@ -167,7 +163,6 @@ def _tally_votes(game):
     if len(leaders) == 1:
         return leaders[0], False, counts
     return None, True, counts
-
 
 def _public_state(game, token):
     players = []
@@ -577,10 +572,8 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
         payload = self._read_json() or {}
         
         def run(game, token, payload):
-            # extract text strictly inside the closure to avoid scoping issues
             raw_text = payload.get("text", "")
             text = str(raw_text).strip()[:MAX_CHAT_LEN]
-            
             if not game.get("chat_open", True):
                 return self._json(403, {"error": "chat_locked"})
             me = self._find_player(game, token)
@@ -642,266 +635,325 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
 
 
 # ===========================================================================
-# HTML
+# HTML (GAME ARENA THEME)
 # ===========================================================================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Imposter Word</title>
+<title>Imposter Protocol</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    background: linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #4c1d95 100%);
-    color: #f8fafc; min-height: 100vh;
-    display: flex; align-items: flex-start; justify-content: center; padding: 16px;
-    padding-bottom: 90px;
+  @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap');
+
+  :root {
+    --bg-base: #05050f;
+    --bg-card: rgba(15, 17, 30, 0.85);
+    --neon-cyan: #00f3ff;
+    --neon-purple: #b026ff;
+    --neon-red: #ff003c;
+    --neon-green: #00ff66;
+    --text-main: #e2e8f0;
+    --text-muted: #94a3b8;
+    --font-ui: 'Rajdhani', sans-serif;
+    --font-mono: 'Share Tech Mono', monospace;
   }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  
+  body {
+    font-family: var(--font-ui);
+    background-color: var(--bg-base);
+    background-image: 
+      linear-gradient(rgba(0, 243, 255, 0.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 243, 255, 0.05) 1px, transparent 1px);
+    background-size: 30px 30px;
+    color: var(--text-main); 
+    min-height: 100vh;
+    display: flex; align-items: flex-start; justify-content: center; 
+    padding: 16px;
+    padding-bottom: 90px;
+    overflow-x: hidden;
+  }
+
+  /* Scanline effect */
+  body::after {
+    content: " ";
+    display: block;
+    position: fixed;
+    top: 0; left: 0; bottom: 0; right: 0;
+    background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+    z-index: 2;
+    background-size: 100% 2px, 3px 100%;
+    pointer-events: none;
+  }
+
   .app {
     width: 100%; max-width: 540px;
-    background: rgba(15, 23, 42, 0.85);
-    border: 1px solid rgba(148, 163, 184, 0.25);
-    border-radius: 20px; padding: 24px 20px;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.5); backdrop-filter: blur(8px);
+    background: var(--bg-card);
+    border: 1px solid rgba(0, 243, 255, 0.3);
+    border-radius: 16px; padding: 28px 24px;
+    box-shadow: 0 0 20px rgba(0, 243, 255, 0.1), inset 0 0 20px rgba(0, 243, 255, 0.05);
+    backdrop-filter: blur(10px);
     margin: auto;
+    position: relative;
+    z-index: 5;
   }
-  h1 { font-size: 1.5rem; text-align: center; margin-bottom: 4px; }
-  h2 { font-size: 1.15rem; text-align: center; margin-bottom: 6px; }
-  .subtitle { text-align: center; color: #94a3b8; font-size: 0.88rem; margin-bottom: 16px; line-height: 1.45; }
+
+  /* Clipped corners for modern arena look */
+  .app::before {
+    content: '';
+    position: absolute;
+    top: -1px; left: -1px; right: -1px; bottom: -1px;
+    border-radius: 16px;
+    pointer-events: none;
+    border: 1px solid transparent;
+    background: linear-gradient(135deg, var(--neon-cyan) 0%, transparent 40%, transparent 60%, var(--neon-purple) 100%) border-box;
+    -webkit-mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: destination-out;
+    mask-composite: exclude;
+  }
+
+  h1 { 
+    font-size: 2rem; text-align: center; margin-bottom: 4px; 
+    text-transform: uppercase; letter-spacing: 2px;
+    color: #fff;
+    text-shadow: 0 0 10px var(--neon-cyan), 0 0 20px var(--neon-cyan);
+  }
+  h2 { 
+    font-size: 1.3rem; text-align: center; margin-bottom: 8px; 
+    text-transform: uppercase; letter-spacing: 1px; color: var(--neon-cyan);
+  }
+  .subtitle { text-align: center; color: var(--text-muted); font-size: 0.95rem; margin-bottom: 20px; font-family: var(--font-mono); }
+  
   .screen { display: none; }
-  .screen.active { display: block; animation: fade 0.25s ease; }
-  @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
-  label { display: block; font-size: 0.85rem; color: #cbd5e1; margin-bottom: 6px; margin-top: 14px; }
+  .screen.active { display: block; animation: glitch-in 0.3s ease; }
+  @keyframes glitch-in { 
+    0% { opacity: 0; transform: translateY(10px) scale(0.98); filter: blur(4px); } 
+    100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); } 
+  }
+
+  label { display: block; font-size: 0.9rem; color: var(--neon-cyan); margin-bottom: 6px; margin-top: 16px; text-transform: uppercase; letter-spacing: 1px; }
+  
   select, input[type="text"] {
-    width: 100%; padding: 12px; border-radius: 10px;
-    border: 1px solid #475569; background: #1e293b; color: #f8fafc; font-size: 1rem;
+    width: 100%; padding: 14px; border-radius: 8px;
+    border: 1px solid rgba(0, 243, 255, 0.4); 
+    background: rgba(0, 0, 0, 0.5); 
+    color: var(--text-main); font-size: 1.1rem; font-family: var(--font-mono);
+    transition: all 0.2s;
   }
-  input[type="text"]:focus, select:focus { outline: 2px solid #6366f1; }
+  input[type="text"]:focus, select:focus { 
+    outline: none; border-color: var(--neon-cyan);
+    box-shadow: 0 0 15px rgba(0, 243, 255, 0.3);
+  }
+
   button {
-    width: 100%; padding: 14px; margin-top: 14px; border: none;
-    border-radius: 12px; background: linear-gradient(135deg, #6366f1, #8b5cf6);
-    color: white; font-size: 1rem; font-weight: 600; cursor: pointer;
-    transition: transform 0.1s, opacity 0.2s;
+    width: 100%; padding: 16px; margin-top: 16px; border: none;
+    border-radius: 8px; 
+    background: rgba(0, 243, 255, 0.1);
+    border: 1px solid var(--neon-cyan);
+    color: var(--neon-cyan); 
+    font-family: var(--font-ui); font-size: 1.1rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+    cursor: pointer;
+    transition: all 0.2s;
+    box-shadow: 0 0 10px rgba(0, 243, 255, 0.1);
   }
-  button:hover { transform: translateY(-1px); opacity: 0.95; }
-  button:active { transform: translateY(1px); }
-  button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-  button.secondary { background: #334155; }
-  button.danger { background: #b91c1c; }
-  button.big { padding: 24px 16px; font-size: 1.1rem; }
-  .mode-grid { display: grid; gap: 14px; margin-top: 20px; }
+  button:hover:not(:disabled) { 
+    background: rgba(0, 243, 255, 0.2); 
+    box-shadow: 0 0 20px rgba(0, 243, 255, 0.4);
+    transform: translateY(-2px);
+  }
+  button:active:not(:disabled) { transform: translateY(0); }
+  button:disabled { opacity: 0.3; cursor: not-allowed; border-color: var(--text-muted); color: var(--text-muted); box-shadow: none; }
+  
+  button.secondary { border-color: var(--text-muted); color: var(--text-muted); background: rgba(148, 163, 184, 0.1); }
+  button.secondary:hover:not(:disabled) { border-color: #fff; color: #fff; box-shadow: 0 0 15px rgba(255, 255, 255, 0.2); }
+  button.danger { border-color: var(--neon-red); color: var(--neon-red); background: rgba(255, 0, 60, 0.1); }
+  button.danger:hover:not(:disabled) { background: rgba(255, 0, 60, 0.2); box-shadow: 0 0 20px rgba(255, 0, 60, 0.4); }
+  button.big { padding: 24px 16px; font-size: 1.2rem; }
+
+  .mode-grid { display: grid; gap: 16px; margin-top: 24px; }
   .mode-card {
-    background: rgba(30,41,59,0.9); border: 2px solid #475569;
-    border-radius: 16px; padding: 18px; cursor: pointer; text-align: left;
-    transition: border-color 0.15s, transform 0.1s; color: #f8fafc;
+    background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(176, 38, 255, 0.4);
+    border-radius: 12px; padding: 20px; cursor: pointer; text-align: left;
+    transition: all 0.2s; color: var(--text-main);
+    position: relative; overflow: hidden;
   }
-  .mode-card:hover { border-color: #6366f1; transform: translateY(-2px); }
-  .mode-card .icon { font-size: 2rem; margin-bottom: 6px; }
-  .mode-card .title { font-size: 1.15rem; font-weight: 700; margin-bottom: 4px; }
-  .mode-card .desc { font-size: 0.85rem; color: #94a3b8; line-height: 1.4; }
-  .role-card { text-align: center; padding: 28px 16px; border-radius: 16px; margin-top: 14px; }
-  .role-card.crew { background: rgba(34, 197, 94, 0.15); border: 1px solid rgba(34,197,94,0.4); }
-  .role-card.imposter { background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239,68,68,0.4); }
-  .role-label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; color: #94a3b8; }
-  .role-word { font-size: 1.8rem; font-weight: 700; margin: 14px 0; word-break: break-word; }
-  .role-card.crew .role-word { color: #86efac; }
-  .role-card.imposter .role-word { color: #fca5a5; }
-  .role-hint { font-size: 0.9rem; color: #cbd5e1; line-height: 1.4; white-space: pre-line; }
-  .progress { text-align: center; font-size: 0.8rem; color: #94a3b8; margin-top: 12px; }
-  .vote-list { display: grid; gap: 10px; margin-top: 14px; }
-  .vote-btn { margin-top: 0; background: #1e293b; border: 1px solid #475569; font-weight: 500; text-align: left; padding-left: 18px; }
-  .vote-btn:hover { background: #334155; }
-  .vote-btn.selected { background: #6366f1; border-color: #818cf8; }
-  .vote-btn.done { opacity: 0.55; }
-  .result-detail { text-align: center; color: #cbd5e1; font-size: 0.95rem; line-height: 1.7; margin-top: 12px; }
-  .result-detail strong { color: #f8fafc; }
-  .clue-item { padding: 10px 14px; background: #1e293b; border-radius: 10px; font-size: 0.9rem; color: #cbd5e1; line-height: 1.4; }
-  .clue-item .name { color: #818cf8; font-weight: 600; }
-  .clue-item.mine { border: 1px solid #6366f1; }
-  .clue-item .play-btn { margin-top: 6px; padding: 6px 12px; font-size: 0.8rem; width: auto; background: #4f46e5; }
-  .round-header { text-align: center; margin: 4px 0 10px; font-size: 0.92rem; color: #a5b4fc; font-weight: 600; letter-spacing: 0.5px; }
-  .error { color: #fca5a5; text-align: center; font-size: 0.85rem; margin-top: 10px; min-height: 1em; }
-  .vote-summary { margin-top: 16px; display: grid; gap: 6px; }
-  .vote-row { display: flex; justify-content: space-between; padding: 8px 12px; background: #1e293b;
-              border-radius: 8px; font-size: 0.9rem; color: #cbd5e1; }
-  .vote-row .count { color: #a5b4fc; font-weight: 600; }
-  .vote-row.top { border: 1px solid #6366f1; }
-  .code-box { text-align: center; font-size: 2rem; font-weight: 800; letter-spacing: 6px;
-              color: #a5b4fc; background: #1e293b; padding: 14px; border-radius: 12px;
-              border: 1px dashed #6366f1; margin: 14px 0; user-select: all; }
-  .players-list { display: grid; gap: 8px; margin-top: 12px; }
-  .player-row { display: flex; justify-content: space-between; align-items: center;
-                padding: 10px 14px; background: #1e293b; border-radius: 10px; font-size: 0.92rem; }
-  .player-row .tag { font-size: 0.75rem; color: #94a3b8; }
-  .player-row.ready { border-left: 3px solid #22c55e; }
-  .tabs { display: flex; gap: 8px; margin-top: 12px; }
+  .mode-card::before {
+    content: ''; position: absolute; top: 0; left: 0; width: 4px; height: 100%;
+    background: var(--neon-purple); transition: width 0.2s;
+  }
+  .mode-card:hover { 
+    border-color: var(--neon-purple); 
+    box-shadow: 0 0 15px rgba(176, 38, 255, 0.2);
+    transform: translateX(4px);
+  }
+  .mode-card:hover::before { width: 100%; opacity: 0.1; }
+  .mode-card .icon { font-size: 2rem; margin-bottom: 8px; }
+  .mode-card .title { font-size: 1.2rem; font-weight: 700; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 1px; color: #fff; }
+  .mode-card .desc { font-size: 0.9rem; color: var(--text-muted); line-height: 1.4; }
+
+  .role-card { 
+    text-align: center; padding: 32px 20px; border-radius: 12px; margin-top: 16px; 
+    position: relative; border: 1px solid;
+  }
+  .role-card.crew { border-color: var(--neon-green); background: rgba(0, 255, 102, 0.05); box-shadow: inset 0 0 30px rgba(0, 255, 102, 0.1); }
+  .role-card.imposter { border-color: var(--neon-red); background: rgba(255, 0, 60, 0.05); box-shadow: inset 0 0 30px rgba(255, 0, 60, 0.1); }
+  .role-label { font-size: 0.9rem; text-transform: uppercase; letter-spacing: 2px; color: var(--text-muted); font-family: var(--font-mono); }
+  .role-word { font-size: 2.2rem; font-weight: 700; margin: 16px 0; word-break: break-word; text-transform: uppercase; letter-spacing: 2px; }
+  .role-card.crew .role-word { color: var(--neon-green); text-shadow: 0 0 15px rgba(0, 255, 102, 0.5); }
+  .role-card.imposter .role-word { color: var(--neon-red); text-shadow: 0 0 15px rgba(255, 0, 60, 0.5); }
+  .role-hint { font-size: 0.95rem; color: var(--text-main); line-height: 1.5; white-space: pre-line; font-family: var(--font-mono); }
+
+  .progress { text-align: center; font-size: 0.85rem; color: var(--neon-purple); margin-top: 16px; font-family: var(--font-mono); letter-spacing: 1px; }
+  
+  .vote-list { display: grid; gap: 12px; margin-top: 16px; }
+  .vote-btn { 
+    margin-top: 0; background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(0, 243, 255, 0.3); 
+    color: var(--text-main); text-align: left; padding: 16px; border-radius: 8px;
+    font-family: var(--font-mono); font-size: 1rem; text-transform: uppercase;
+  }
+  .vote-btn:hover:not(:disabled) { border-color: var(--neon-cyan); background: rgba(0, 243, 255, 0.1); color: var(--neon-cyan); }
+  .vote-btn.selected { border-color: var(--neon-cyan); background: rgba(0, 243, 255, 0.15); color: #fff; box-shadow: 0 0 15px rgba(0, 243, 255, 0.3); }
+  .vote-btn.done { opacity: 0.5; border-style: dashed; }
+
+  .result-detail { text-align: center; color: var(--text-main); font-size: 1rem; line-height: 1.8; margin-top: 16px; font-family: var(--font-mono); }
+  .result-detail strong { color: #fff; text-shadow: 0 0 5px rgba(255,255,255,0.5); }
+  
+  .clue-item { padding: 12px 16px; background: rgba(0, 0, 0, 0.4); border-radius: 8px; font-size: 0.95rem; color: var(--text-main); line-height: 1.5; border-left: 2px solid var(--neon-purple); font-family: var(--font-mono); }
+  .clue-item .name { color: var(--neon-purple); font-weight: 600; text-transform: uppercase; }
+  .clue-item.mine { border-left-color: var(--neon-cyan); }
+  .clue-item .play-btn { margin-top: 8px; padding: 6px 12px; font-size: 0.8rem; width: auto; background: rgba(0, 243, 255, 0.1); border: 1px solid var(--neon-cyan); color: var(--neon-cyan); }
+
+  .round-header { text-align: center; margin: 8px 0 12px; font-size: 0.9rem; color: var(--neon-cyan); font-weight: 600; letter-spacing: 2px; text-transform: uppercase; font-family: var(--font-mono); }
+  .error { color: var(--neon-red); text-align: center; font-size: 0.9rem; margin-top: 12px; min-height: 1em; font-family: var(--font-mono); text-shadow: 0 0 5px rgba(255, 0, 60, 0.5); }
+  
+  .vote-summary { margin-top: 16px; display: grid; gap: 8px; }
+  .vote-row { display: flex; justify-content: space-between; padding: 10px 16px; background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; font-size: 0.95rem; color: var(--text-main); font-family: var(--font-mono); }
+  .vote-row .count { color: var(--neon-cyan); font-weight: 600; }
+  .vote-row.top { border-color: var(--neon-cyan); box-shadow: 0 0 10px rgba(0, 243, 255, 0.1); }
+  
+  .code-box { 
+    text-align: center; font-size: 2.5rem; font-weight: 800; letter-spacing: 8px; font-family: var(--font-mono);
+    color: #fff; background: rgba(0, 0, 0, 0.6); padding: 16px; border-radius: 12px;
+    border: 1px solid var(--neon-cyan); box-shadow: 0 0 20px rgba(0, 243, 255, 0.2), inset 0 0 15px rgba(0, 243, 255, 0.1);
+    margin: 16px 0; user-select: all; text-shadow: 0 0 10px var(--neon-cyan);
+  }
+  
+  .players-list { display: grid; gap: 8px; margin-top: 16px; }
+  .player-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: rgba(0, 0, 0, 0.4); border-radius: 8px; font-size: 0.95rem; font-family: var(--font-mono); border: 1px solid rgba(148,163,184,0.1); }
+  .player-row .tag { font-size: 0.8rem; color: var(--text-muted); }
+  .player-row.ready { border-color: var(--neon-green); background: rgba(0, 255, 102, 0.05); }
+  .player-row.ready .tag { color: var(--neon-green); }
+
+  .tabs { display: flex; gap: 12px; margin-top: 16px; }
   .tabs button { margin-top: 0; }
-  .small { font-size: 0.78rem; color: #94a3b8; text-align:center; margin-top: 8px; }
-  .qr-wrap { text-align: center; margin: 12px 0; }
-  .qr-wrap img { width: 180px; height: 180px; border-radius: 12px; background: white; padding: 8px; }
-  .imposter-pill {
-    display:inline-block; background: rgba(239,68,68,0.2); color:#fca5a5;
-    border: 1px solid rgba(239,68,68,0.5); border-radius:999px;
-    padding:4px 12px; font-size:0.8rem; margin: 2px;
-  }
-  .banner {
-    text-align:center; padding: 18px 14px; border-radius: 14px; margin-top: 8px;
-    font-size: 1.15rem; font-weight: 700; line-height: 1.4;
-  }
-  .banner.crew { background: rgba(34,197,94,0.15); border:1px solid rgba(34,197,94,0.5); color:#86efac; }
-  .banner.imposter { background: rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.5); color:#fca5a5; }
-  .banner.tie { background: rgba(253,224,71,0.12); border:1px solid rgba(253,224,71,0.45); color:#fde68a; }
-  .pass-banner {
-    text-align: center; padding: 30px 20px;
-    background: linear-gradient(135deg, rgba(99,102,241,0.15), rgba(139,92,246,0.15));
-    border: 1px solid rgba(99,102,241,0.4); border-radius: 16px; margin-bottom: 16px;
-  }
-  .pass-banner .who { font-size: 1.5rem; font-weight: 700; color: #a5b4fc; margin-bottom: 8px; }
-  .pass-banner .msg { font-size: 0.95rem; color: #cbd5e1; line-height: 1.5; }
-  .recorder {
-    display: flex; align-items: center; gap: 12px;
-    background: #1e293b; border: 1px solid #475569; border-radius: 12px;
-    padding: 12px; margin-top: 8px;
-  }
-  .rec-btn {
-    width: 60px; height: 60px; border-radius: 50%;
-    background: #dc2626; border: 2px solid #7f1d1d;
-    color: white; font-size: 1.5rem; padding: 0; margin: 0;
-    flex-shrink: 0; cursor: pointer;
-  }
+  .small { font-size: 0.8rem; color: var(--text-muted); text-align:center; margin-top: 12px; font-family: var(--font-mono); }
+  
+  .qr-wrap { text-align: center; margin: 16px 0; }
+  .qr-wrap img { width: 180px; height: 180px; border-radius: 12px; background: white; padding: 10px; box-shadow: 0 0 20px rgba(0, 243, 255, 0.3); }
+  
+  .imposter-pill { display:inline-block; background: rgba(255, 0, 60, 0.1); color:var(--neon-red); border: 1px solid var(--neon-red); border-radius: 4px; padding:4px 12px; font-size:0.85rem; margin: 4px; text-transform: uppercase; font-family: var(--font-mono); box-shadow: 0 0 8px rgba(255,0,60,0.2); }
+  
+  .banner { text-align:center; padding: 20px 16px; border-radius: 12px; margin-top: 12px; font-size: 1.4rem; font-weight: 700; text-transform: uppercase; letter-spacing: 2px; border: 1px solid; }
+  .banner.crew { border-color: var(--neon-green); background: rgba(0, 255, 102, 0.1); color: #fff; text-shadow: 0 0 10px var(--neon-green); box-shadow: 0 0 20px rgba(0, 255, 102, 0.2); }
+  .banner.imposter { border-color: var(--neon-red); background: rgba(255, 0, 60, 0.1); color: #fff; text-shadow: 0 0 10px var(--neon-red); box-shadow: 0 0 20px rgba(255, 0, 60, 0.2); }
+  .banner.tie { border-color: #fde68a; background: rgba(253, 224, 71, 0.1); color: #fff; text-shadow: 0 0 10px #fde68a; box-shadow: 0 0 20px rgba(253, 224, 71, 0.2); }
+
+  .pass-banner { text-align: center; padding: 32px 20px; background: rgba(0, 243, 255, 0.05); border: 1px dashed var(--neon-cyan); border-radius: 12px; margin-bottom: 16px; }
+  .pass-banner .who { font-size: 1.6rem; font-weight: 700; color: #fff; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+  .pass-banner .msg { font-size: 0.95rem; color: var(--text-muted); line-height: 1.5; font-family: var(--font-mono); }
+
+  .recorder { display: flex; align-items: center; gap: 16px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255, 0, 60, 0.3); border-radius: 12px; padding: 16px; margin-top: 12px; }
+  .rec-btn { width: 64px; height: 64px; border-radius: 50%; background: rgba(255, 0, 60, 0.1); border: 2px solid var(--neon-red); color: var(--neon-red); font-size: 1.6rem; padding: 0; margin: 0; flex-shrink: 0; cursor: pointer; transition: all 0.2s; box-shadow: 0 0 10px rgba(255, 0, 60, 0.2); }
+  .rec-btn:hover { background: rgba(255, 0, 60, 0.2); box-shadow: 0 0 20px rgba(255, 0, 60, 0.4); }
   .rec-btn:active { transform: scale(0.92); }
-  .rec-btn.recording { background: #991b1b; animation: pulse 1s infinite; }
-  @keyframes pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.7); }
-    50% { box-shadow: 0 0 0 12px rgba(220,38,38,0); }
-  }
-  .rec-info { flex: 1; font-size: 0.85rem; color: #cbd5e1; line-height: 1.4; }
-  .rec-timer { color: #fca5a5; font-weight: 700; font-size: 1rem; }
-  .rec-clear { padding: 6px 12px; font-size: 0.8rem; width: auto; margin: 0; background: #475569; }
-  .chat-fab {
-    position: fixed; bottom: 18px; right: 18px;
-    width: 56px; height: 56px; border-radius: 50%;
-    background: linear-gradient(135deg, #6366f1, #8b5cf6);
-    box-shadow: 0 8px 24px rgba(99,102,241,0.5);
-    color: white; font-size: 1.4rem; padding: 0; margin: 0;
-    display: flex; align-items: center; justify-content: center;
-    cursor: pointer; z-index: 100;
-  }
-  .chat-fab .unread {
-    position: absolute; top: 4px; right: 4px;
-    background: #ef4444; color: white; font-size: 0.7rem;
-    min-width: 18px; height: 18px; border-radius: 9px;
-    display: flex; align-items: center; justify-content: center;
-    padding: 0 4px; font-weight: 700;
-  }
-  .chat-panel {
-    position: fixed; bottom: 0; left: 0; right: 0; top: 0;
-    background: rgba(2, 6, 23, 0.95); z-index: 200;
-    display: none; flex-direction: column;
-  }
+  .rec-btn.recording { background: var(--neon-red); color: #fff; animation: pulse-red 1s infinite; }
+  @keyframes pulse-red { 0%, 100% { box-shadow: 0 0 0 0 rgba(255, 0, 60, 0.7); } 50% { box-shadow: 0 0 0 15px rgba(255, 0, 60, 0); } }
+  .rec-info { flex: 1; font-size: 0.9rem; color: var(--text-main); line-height: 1.4; font-family: var(--font-mono); }
+  .rec-timer { color: var(--neon-red); font-weight: 700; font-size: 1.1rem; }
+  .rec-clear { padding: 8px 16px; font-size: 0.85rem; width: auto; margin: 0; background: transparent; border: 1px solid var(--text-muted); color: var(--text-muted); }
+
+  .chat-fab { position: fixed; bottom: 24px; right: 24px; width: 60px; height: 60px; border-radius: 50%; background: var(--bg-card); border: 1px solid var(--neon-cyan); box-shadow: 0 0 20px rgba(0, 243, 255, 0.3); color: var(--neon-cyan); font-size: 1.5rem; padding: 0; margin: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; z-index: 100; transition: all 0.2s; }
+  .chat-fab:hover { transform: scale(1.1); box-shadow: 0 0 30px rgba(0, 243, 255, 0.5); }
+  .chat-fab .unread { position: absolute; top: 0; right: 0; background: var(--neon-red); color: #fff; font-size: 0.75rem; font-family: var(--font-mono); min-width: 20px; height: 20px; border-radius: 10px; display: flex; align-items: center; justify-content: center; padding: 0 4px; font-weight: 700; box-shadow: 0 0 10px var(--neon-red); }
+
+  .chat-panel { position: fixed; bottom: 0; left: 0; right: 0; top: 0; background: rgba(5, 5, 15, 0.95); backdrop-filter: blur(10px); z-index: 200; display: none; flex-direction: column; }
   .chat-panel.open { display: flex; }
-  .chat-header {
-    padding: 16px; border-bottom: 1px solid #334155;
-    display: flex; justify-content: space-between; align-items: center;
-    background: #0f172a;
-  }
-  .chat-header h3 { font-size: 1.1rem; }
-  .chat-close {
-    background: transparent; border: none; color: white;
-    font-size: 1.6rem; width: auto; padding: 0 8px; margin: 0;
-  }
-  .chat-messages {
-    flex: 1; overflow-y: auto; padding: 12px 16px;
-    display: flex; flex-direction: column; gap: 8px;
-  }
-  .chat-msg {
-    max-width: 80%; padding: 8px 12px; border-radius: 12px;
-    font-size: 0.9rem; line-height: 1.4; word-wrap: break-word;
-  }
-  .chat-msg.mine { align-self: flex-end; background: #4f46e5; border-bottom-right-radius: 4px; }
-  .chat-msg.other { align-self: flex-start; background: #334155; border-bottom-left-radius: 4px; }
-  .chat-msg.system { align-self: center; background: transparent; color: #94a3b8;
-                      font-size: 0.78rem; font-style: italic; text-align: center; padding: 4px; }
-  .chat-msg .sender { font-size: 0.72rem; opacity: 0.7; margin-bottom: 2px; font-weight: 600; }
-  .chat-input-row {
-    padding: 12px 16px 20px; border-top: 1px solid #334155;
-    display: flex; gap: 8px; background: #0f172a;
-  }
+  .chat-header { padding: 20px; border-bottom: 1px solid rgba(0, 243, 255, 0.3); display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.5); }
+  .chat-header h3 { font-size: 1.2rem; text-transform: uppercase; letter-spacing: 2px; color: var(--neon-cyan); }
+  .chat-close { background: transparent; border: none; color: var(--text-muted); font-size: 2rem; width: auto; padding: 0 8px; margin: 0; cursor: pointer; }
+  .chat-close:hover { color: #fff; }
+  .chat-messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+  .chat-msg { max-width: 85%; padding: 10px 16px; border-radius: 8px; font-size: 0.95rem; line-height: 1.4; font-family: var(--font-mono); word-wrap: break-word; }
+  .chat-msg.mine { align-self: flex-end; background: rgba(0, 243, 255, 0.1); border: 1px solid var(--neon-cyan); color: #fff; border-bottom-right-radius: 0; }
+  .chat-msg.other { align-self: flex-start; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); color: var(--text-main); border-bottom-left-radius: 0; }
+  .chat-msg.system { align-self: center; background: transparent; color: var(--neon-purple); font-size: 0.8rem; font-style: italic; text-align: center; padding: 8px; }
+  .chat-msg .sender { font-size: 0.75rem; opacity: 0.8; margin-bottom: 4px; font-weight: 700; text-transform: uppercase; color: var(--neon-purple); }
+  .chat-input-row { padding: 16px 20px 30px; border-top: 1px solid rgba(0, 243, 255, 0.3); display: flex; gap: 12px; background: rgba(0,0,0,0.5); }
   .chat-input-row input { flex: 1; margin: 0; }
-  .chat-input-row button { width: auto; padding: 12px 18px; margin: 0; }
-  .chat-locked {
-    padding: 10px; text-align: center; color: #fca5a5;
-    font-size: 0.85rem; background: rgba(239,68,68,0.1);
-    border-top: 1px solid rgba(239,68,68,0.3);
-  }
-  .menu-fab {
-    position: fixed; bottom: 18px; left: 18px;
-    width: 48px; height: 48px; border-radius: 50%;
-    background: #334155; color: white; font-size: 1.4rem;
-    padding: 0; margin: 0; z-index: 100;
-    display: flex; align-items: center; justify-content: center;
-    box-shadow: 0 6px 18px rgba(0,0,0,0.4);
-  }
-  .menu-panel {
-    position: fixed; inset: 0; background: rgba(2,6,23,0.9); z-index: 300;
-    display: none; align-items: center; justify-content: center; padding: 20px;
-  }
+  .chat-input-row button { width: auto; padding: 12px 24px; margin: 0; }
+  .chat-locked { padding: 16px; text-align: center; color: var(--neon-red); font-size: 0.9rem; font-family: var(--font-mono); background: rgba(255, 0, 60, 0.1); border-top: 1px solid rgba(255, 0, 60, 0.3); }
+
+  .menu-fab { position: fixed; bottom: 24px; left: 24px; width: 50px; height: 50px; border-radius: 50%; background: var(--bg-card); border: 1px solid rgba(255, 255, 255, 0.2); color: #fff; font-size: 1.4rem; padding: 0; margin: 0; z-index: 100; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 0 15px rgba(0,0,0,0.5); transition: all 0.2s; }
+  .menu-fab:hover { background: rgba(255,255,255,0.1); border-color: #fff; }
+  
+  .menu-panel { position: fixed; inset: 0; background: rgba(5, 5, 15, 0.8); backdrop-filter: blur(5px); z-index: 300; display: none; align-items: center; justify-content: center; padding: 20px; }
   .menu-panel.open { display: flex; }
-  .menu-card {
-    background: #0f172a; border: 1px solid #334155; border-radius: 16px;
-    padding: 24px; max-width: 380px; width: 100%;
-  }
-  .menu-card h3 { margin-bottom: 14px; text-align: center; }
-  .menu-card button { margin-top: 10px; }
-  .scoreboard { background: #1e293b; border-radius: 12px; padding: 10px 14px; margin-top: 12px; }
-  .scoreboard h4 { font-size: 0.85rem; color: #94a3b8; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
-  .score-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 0.9rem; }
-  .score-row .pts { color: #86efac; font-weight: 700; }
-  .badge { display:inline-block; background:#4f46e5; padding:4px 10px; border-radius:999px; font-size:0.75rem; font-weight:600; }
-  .badge.local { background:#0d9488; }
+  .menu-card { background: var(--bg-card); border: 1px solid var(--neon-cyan); border-radius: 16px; padding: 28px; max-width: 400px; width: 100%; box-shadow: 0 0 30px rgba(0, 243, 255, 0.2); }
+  .menu-card h3 { margin-bottom: 20px; text-align: center; font-size: 1.4rem; text-transform: uppercase; letter-spacing: 2px; color: #fff; text-shadow: 0 0 10px var(--neon-cyan); }
+  .menu-card button { margin-top: 12px; }
+  .menu-card .small { margin-bottom: 20px; font-size: 0.9rem; }
+
+  .scoreboard { background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(176, 38, 255, 0.3); border-radius: 12px; padding: 16px; margin-top: 16px; box-shadow: inset 0 0 15px rgba(176, 38, 255, 0.05); }
+  .scoreboard h4 { font-size: 0.9rem; color: var(--neon-purple); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 2px; text-align: center; }
+  .score-row { display: flex; justify-content: space-between; padding: 8px 0; font-size: 0.95rem; font-family: var(--font-mono); border-bottom: 1px solid rgba(255,255,255,0.05); }
+  .score-row:last-child { border-bottom: none; }
+  .score-row .pts { color: var(--neon-cyan); font-weight: 700; text-shadow: 0 0 5px var(--neon-cyan); }
+  
+  .badge { display:inline-block; background: rgba(0, 243, 255, 0.1); border: 1px solid var(--neon-cyan); color: var(--neon-cyan); padding: 4px 12px; border-radius: 4px; font-size:0.8rem; font-weight:600; text-transform: uppercase; font-family: var(--font-mono); letter-spacing: 1px; }
+  .badge.local { background: rgba(0, 255, 102, 0.1); border-color: var(--neon-green); color: var(--neon-green); }
 </style>
 </head>
 <body>
 <div class="app">
-  <h1>🕵️ Imposter Word <span id="modeBadge" class="badge" style="display:none;"></span></h1>
-  <p class="subtitle">Same word — except the imposters.</p>
+  <h1>Imposter Protocol <span id="modeBadge" class="badge" style="display:none;"></span></h1>
+  <p class="subtitle">Find the traitor. Trust no one.</p>
 
   <div id="screen-mode" class="screen active">
     <div class="mode-grid">
       <div class="mode-card" onclick="pickMode('online')">
         <div class="icon">🌐</div>
-        <div class="title">Play online</div>
-        <div class="desc">Each player on their own phone. Create a room or join with a code. Real-time chat.</div>
+        <div class="title">Network Link</div>
+        <div class="desc">Play online with multiple devices. Create a lobby or join a secure channel.</div>
       </div>
       <div class="mode-card" onclick="pickMode('local')">
         <div class="icon">📱</div>
-        <div class="title">Play on this phone</div>
-        <div class="desc">Pass one phone around. Everyone sees their role privately. No internet needed.</div>
+        <div class="title">Local Terminal</div>
+        <div class="desc">Pass one device around. Secure role reveal and local voting.</div>
       </div>
     </div>
-    <div class="small" id="resumeHint" style="display:none;">
-      <button class="secondary" onclick="resumeSession()" style="margin-top:16px;">Resume last online game</button>
+    <div class="small" id="resumeHint" style="display:none; margin-top:24px;">
+      <button class="secondary" onclick="resumeSession()">Resume Active Link</button>
     </div>
   </div>
 
   <div id="screen-home" class="screen">
-    <button class="secondary" onclick="backToMode()" style="width:auto;padding:8px 14px;font-size:0.85rem;margin:0 0 10px;">← Back</button>
-    <label for="playerName">Your name</label>
-    <input type="text" id="playerName" maxlength="20" placeholder="e.g. Rahul" autocomplete="off">
+    <button class="secondary" onclick="backToMode()" style="width:auto;padding:8px 16px;font-size:0.9rem;margin:0 0 16px;">← Disconnect</button>
+    <label for="playerName">Agent Name</label>
+    <input type="text" id="playerName" maxlength="20" placeholder="ENTER ID..." autocomplete="off">
     <div class="tabs">
-      <button onclick="createGame()">Create game</button>
-      <button class="secondary" onclick="showJoin()">Join game</button>
+      <button onclick="createGame()">Host Game</button>
+      <button class="secondary" onclick="showJoin()">Join Game</button>
     </div>
-    <div id="joinBox" style="display:none;">
-      <label for="joinCode">Room code</label>
+    <div id="joinBox" style="display:none; margin-top:16px;">
+      <label for="joinCode">Lobby Code</label>
       <input type="text" id="joinCode" maxlength="6" placeholder="XK4P2Q"
-             style="text-transform:uppercase;letter-spacing:3px;text-align:center;font-size:1.3rem;"
+             style="text-transform:uppercase;letter-spacing:6px;text-align:center;font-size:1.5rem;"
              autocomplete="off">
-      <button onclick="joinGame()">Join</button>
+      <button onclick="joinGame()">Establish Connection</button>
     </div>
-    <label for="lang">Language / भाषा (host only)</label>
+    <label for="lang" style="margin-top:24px;">Language / भाषा</label>
     <select id="lang">
       <option value="en">English</option>
       <option value="hi">हिन्दी (Hindi)</option>
@@ -910,90 +962,90 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <div id="screen-local-setup" class="screen">
-    <button class="secondary" onclick="backToMode()" style="width:auto;padding:8px 14px;font-size:0.85rem;margin:0 0 10px;">← Back</button>
-    <h2>📱 Play on this phone</h2>
-    <p class="subtitle">Enter the players, then pass the phone around.</p>
+    <button class="secondary" onclick="backToMode()" style="width:auto;padding:8px 16px;font-size:0.9rem;margin:0 0 16px;">← Disconnect</button>
+    <h2>Local Terminal</h2>
+    <p class="subtitle">Configure agents for this terminal.</p>
     <label for="localLang">Language / भाषा</label>
     <select id="localLang">
       <option value="en">English</option>
       <option value="hi">हिन्दी (Hindi)</option>
     </select>
-    <label for="localNumPlayers">Number of players (3–10)</label>
+    <label for="localNumPlayers">Number of Agents (3–10)</label>
     <input type="text" id="localNumPlayers" value="4" inputmode="numeric" style="text-align:center;font-size:1.3rem;">
-    <div id="localNameInputs" style="margin-top:12px;"></div>
+    <div id="localNameInputs" style="margin-top:16px;"></div>
     <div id="localImposterBox">
-      <label for="localNumImposters">Number of imposters</label>
+      <label for="localNumImposters">Number of Imposters</label>
       <select id="localNumImposters">
-        <option value="1">1 imposter</option>
-        <option value="2">2 imposters</option>
-        <option value="3">3 imposters</option>
+        <option value="1">1 Imposter</option>
+        <option value="2">2 Imposters</option>
+        <option value="3">3 Imposters</option>
       </select>
       <div class="small" id="localImposterNote"></div>
     </div>
-    <button onclick="startLocalGame()">▶ Start local game</button>
+    <button onclick="startLocalGame()" style="margin-top:24px;">Initialize Protocol</button>
     <div id="localError" class="error"></div>
   </div>
 
   <div id="screen-lobby" class="screen">
-    <h2>Lobby</h2>
-    <p class="subtitle">Scan the QR or share the code</p>
+    <h2>Waiting Room</h2>
+    <p class="subtitle">Scan QR or share Lobby Code</p>
     <div class="code-box" id="lobbyCode">------</div>
     <div class="qr-wrap" id="qrWrap"></div>
     <div class="players-list" id="lobbyPlayers"></div>
     <div class="progress" id="lobbyProgress"></div>
-    <div id="hostImposterBox" style="display:none;">
-      <label for="numImposters">Number of imposters</label>
+    <div id="hostImposterBox" style="display:none; margin-top:16px;">
+      <label for="numImposters">Imposter Count</label>
       <select id="numImposters">
-        <option value="1">1 imposter</option>
-        <option value="2">2 imposters</option>
-        <option value="3">3 imposters</option>
+        <option value="1">1 Imposter</option>
+        <option value="2">2 Imposters</option>
+        <option value="3">3 Imposters</option>
       </select>
       <div class="small" id="imposterNote"></div>
     </div>
-    <button id="lobbyReadyBtn" onclick="toggleReady()">I'm ready</button>
-    <button id="lobbyStartBtn" onclick="startGame()" style="display:none;">Start game</button>
+    <button id="lobbyReadyBtn" onclick="toggleReady()" style="margin-top:24px;">Ready Up</button>
+    <button id="lobbyStartBtn" onclick="startGame()" style="display:none; margin-top:16px; border-color: var(--neon-green); color: var(--neon-green); background: rgba(0,255,102,0.1);">Start Protocol</button>
     <div class="error" id="lobbyError"></div>
-    <div class="small">Auto-updates every 1.5s.</div>
+    <div class="small">Syncing data...</div>
   </div>
 
   <div id="screen-pass" class="screen">
     <div class="pass-banner">
-      <div class="who">👉 Pass to <span id="passWho">Player 1</span></div>
-      <div class="msg">Make sure nobody else is looking at the screen.</div>
+      <div class="who">Pass Terminal to <span id="passWho">Agent 1</span></div>
+      <div class="msg">Ensure no other agents are observing the screen.</div>
     </div>
-    <button class="big" onclick="revealRole()">I'm <span id="passWhoInline">Player 1</span> — show my role</button>
+    <button class="big" onclick="revealRole()">I am <span id="passWhoInline">Agent 1</span> — Show Role</button>
   </div>
 
   <div id="screen-reveal" class="screen">
     <div class="round-header" id="revealRound">ROLE REVEAL</div>
-    <h2>Your secret role</h2>
-    <p class="subtitle">Keep this hidden!</p>
+    <h2>Your Secret Role</h2>
+    <p class="subtitle">Memorize this. Do not share.</p>
     <div id="revealCard" class="role-card">
       <div class="role-label" id="revealLabel">—</div>
       <div class="role-word" id="revealWord">—</div>
       <div class="role-hint" id="revealHint"></div>
     </div>
-    <button onclick="hostAdvance()" id="revealNextBtn" style="display:none;">Everyone ready — go to clues →</button>
-    <button class="secondary" onclick="localHideAndContinue()" id="revealLocalBtn" style="display:none;">Hide &amp; continue</button>
-    <div class="progress" id="revealProgress">Only the host can advance.</div>
+    <button onclick="hostAdvance()" id="revealNextBtn" style="display:none; border-color: var(--neon-green); color: var(--neon-green); background: rgba(0,255,102,0.1);">Proceed to Clues →</button>
+    <button class="secondary" onclick="localHideAndContinue()" id="revealLocalBtn" style="display:none;">Hide &amp; Continue</button>
+    <div class="progress" id="revealProgress">Waiting for host...</div>
   </div>
 
   <div id="screen-clue" class="screen">
     <div class="round-header" id="clueRoundHeader">ROUND 1 — CLUES</div>
-    <h2>Give your clue</h2>
-    <p class="subtitle">Type a clue <em>or</em> record a voice note (max 10s).</p>
-    <div style="text-align:center;"><span class="badge" id="cluePlayerName">—</span></div>
-    <label for="clueInput">Type your clue</label>
-    <input type="text" id="clueInput" maxlength="80" placeholder="Type your clue..." autocomplete="off">
-    <button id="clueSubmitBtn" onclick="submitClue()">Submit written clue</button>
-    <div style="text-align:center;color:#94a3b8;font-size:0.85rem;margin:14px 0 6px;">— OR —</div>
+    <h2>Transmit Clue</h2>
+    <p class="subtitle">Provide a clue. Do not say the word.</p>
+    <div style="text-align:center; margin-bottom:16px;"><span class="badge" id="cluePlayerName">—</span></div>
+    <label for="clueInput">Text Transmission</label>
+    <input type="text" id="clueInput" maxlength="80" placeholder="ENTER CLUE..." autocomplete="off">
+    <button id="clueSubmitBtn" onclick="submitClue()">Send Text</button>
+    <div style="text-align:center;color:var(--neon-cyan);font-size:0.9rem;margin:20px 0 10px; font-family: var(--font-mono);">— OR —</div>
     <div class="recorder" id="recorderBox">
       <button class="rec-btn" id="recBtn" onclick="toggleRecording()">🎙️</button>
-      <div class="rec-info" id="recInfo">Tap the mic to record a voice clue.<br>Max 10 seconds.</div>
+      <div class="rec-info" id="recInfo">Tap to record voice transmission.<br>Max 10 seconds.</div>
       <button class="rec-clear" id="recClearBtn" onclick="clearRecording()" style="display:none;">Clear</button>
     </div>
-    <audio id="recPlayback" controls style="width:100%;margin-top:8px;display:none;"></audio>
-    <button id="voiceSubmitBtn" onclick="submitVoice()" style="display:none;">Submit voice clue</button>
+    <audio id="recPlayback" controls style="width:100%;margin-top:12px;display:none; border-radius:8px; border:1px solid var(--neon-cyan);"></audio>
+    <button id="voiceSubmitBtn" onclick="submitVoice()" style="display:none; border-color: var(--neon-cyan); color: var(--neon-cyan);">Send Audio</button>
     <div class="error" id="clueError"></div>
     <div class="players-list" id="clueWaitingList"></div>
     <div class="progress" id="clueProgress"></div>
@@ -1001,37 +1053,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   <div id="screen-summary" class="screen">
     <div class="round-header" id="summaryHeader">ROUND 1 COMPLETE</div>
-    <h2>All clues</h2>
-    <p class="subtitle">Read carefully. Tap ▶ to play voice clues.</p>
-    <div id="summaryList" style="display:grid;gap:8px;margin-top:12px;"></div>
-    <button onclick="hostAdvance()" id="summaryNextBtn" style="display:none;">Continue →</button>
-    <div class="progress" id="summaryProgress">Waiting for the host...</div>
+    <h2>Data Log</h2>
+    <p class="subtitle">Analyze the clues. Tap ▶ to play audio.</p>
+    <div id="summaryList" style="display:grid;gap:10px;margin-top:16px;"></div>
+    <button onclick="hostAdvance()" id="summaryNextBtn" style="display:none; border-color: var(--neon-green); color: var(--neon-green); background: rgba(0,255,102,0.1);">Next Round →</button>
+    <div class="progress" id="summaryProgress">Waiting for host...</div>
   </div>
 
   <div id="screen-vote" class="screen">
-    <h2>Vote!</h2>
-    <p class="subtitle">Who is an imposter?</p>
-    <div style="text-align:center;"><span class="badge" id="voteVoterName">—</span></div>
-    <label>Your vote</label>
+    <h2>Voting Phase</h2>
+    <p class="subtitle">Identify the imposter.</p>
+    <div style="text-align:center; margin-bottom:16px;"><span class="badge" id="voteVoterName">—</span></div>
+    <label>Select Target</label>
     <div id="voteList" class="vote-list"></div>
-    <button id="voteSubmitBtn" onclick="submitVote()" disabled>Lock in vote</button>
+    <button id="voteSubmitBtn" onclick="submitVote()" disabled style="border-color: var(--neon-red); color: var(--neon-red); background: rgba(255,0,60,0.1);">Lock Vote</button>
     <div class="error" id="voteError"></div>
     <div class="players-list" id="voteWaitingList"></div>
-    <div class="small" id="voteChatHint">💬 Use chat below to discuss while waiting.</div>
+    <div class="small" id="voteChatHint">💬 Use comms link to discuss.</div>
   </div>
 
   <div id="screen-result" class="screen">
     <div id="resultBanner" class="banner">—</div>
     <div class="result-detail" id="resultDetail"></div>
-    <div id="voteSummaryBox" style="margin-top:14px;">
+    <div id="voteSummaryBox" style="margin-top:20px;">
       <div class="round-header">VOTE TALLY</div>
       <div id="voteSummary" class="vote-summary"></div>
     </div>
-    <div id="imposterBox" style="margin-top:14px;text-align:center;"></div>
+    <div id="imposterBox" style="margin-top:20px;text-align:center;"></div>
     <div class="scoreboard" id="scoreboard"></div>
-    <div id="resultClues" style="margin-top:14px;"></div>
-    <button onclick="playAgain()" id="playAgainBtn" style="display:none;">▶ Play again (same players)</button>
-    <button class="secondary" onclick="backToMode()">🏠 Back to menu</button>
+    <div id="resultClues" style="margin-top:20px;"></div>
+    <button onclick="playAgain()" id="playAgainBtn" style="display:none; border-color: var(--neon-cyan); color: var(--neon-cyan); background: rgba(0,243,255,0.1);">Restart Protocol</button>
+    <button class="secondary" onclick="backToMode()" style="margin-top:16px;">Disconnect</button>
     <div class="progress" id="resultProgress"></div>
   </div>
 </div>
@@ -1042,13 +1094,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <div class="chat-panel" id="chatPanel">
   <div class="chat-header">
-    <h3>💬 Room chat</h3>
+    <h3>Secure Comms</h3>
     <button class="chat-close" onclick="toggleChat()">×</button>
   </div>
   <div class="chat-messages" id="chatMessages"></div>
-  <div class="chat-locked" id="chatLocked" style="display:none;">Chat is locked during this phase.</div>
+  <div class="chat-locked" id="chatLocked" style="display:none;">Comms locked during this phase.</div>
   <div class="chat-input-row" id="chatInputRow">
-    <input type="text" id="chatInput" maxlength="200" placeholder="Say something..." autocomplete="off">
+    <input type="text" id="chatInput" maxlength="200" placeholder="Transmit message..." autocomplete="off">
     <button onclick="sendChat()">Send</button>
   </div>
 </div>
@@ -1057,19 +1109,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <div class="menu-panel" id="menuPanel">
   <div class="menu-card">
-    <h3>Game menu</h3>
-    <div class="small" style="margin-bottom:12px;">
-      Room: <strong id="menuRoomCode">------</strong><br>
-      You: <strong id="menuYouName">—</strong>
+    <h3>System Menu</h3>
+    <div class="small" style="margin-bottom:20px;">
+      Lobby: <strong id="menuRoomCode">------</strong><br>
+      Agent: <strong id="menuYouName">—</strong>
     </div>
-    <button class="secondary" onclick="leaveGame()">🚪 Leave game</button>
-    <button class="danger" id="menuEndBtn" onclick="endGame()" style="display:none;">🛑 End game for everyone</button>
+    <button class="secondary" onclick="leaveGame()">🚪 Disconnect</button>
+    <button class="danger" id="menuEndBtn" onclick="endGame()" style="display:none;">🛑 Terminate Lobby</button>
     <button class="secondary" onclick="toggleMenu()">Cancel</button>
   </div>
 </div>
 
 <script>
-const STORAGE_KEY = 'imposter_session_v7';
+const STORAGE_KEY = 'imposter_session_v8';
 let session = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
 let current = null;
 let pollTimer = null;
@@ -1125,7 +1177,7 @@ function pickMode(mode) {
     show('screen-home');
   } else {
     $('modeBadge').style.display = 'inline-block';
-    $('modeBadge').textContent = '📱 LOCAL';
+    $('modeBadge').textContent = 'LOCAL';
     $('modeBadge').className = 'badge local';
     initLocalSetup();
     show('screen-local-setup');
@@ -1157,7 +1209,7 @@ function err(msg) { $('homeError').textContent = msg || ''; }
 async function createGame() {
   err('');
   const name = $('playerName').value.trim();
-  if (!name) return err('Enter your name first');
+  if (!name) return err('Enter Agent Name');
   const lang = $('lang').value;
   try {
     const r = await api('create', { name, lang });
@@ -1169,22 +1221,22 @@ async function joinGame() {
   err('');
   const name = $('playerName').value.trim();
   const code = $('joinCode').value.trim().toUpperCase();
-  if (!name) return err('Enter your name first');
-  if (code.length !== 6) return err('Room code must be 6 characters');
+  if (!name) return err('Enter Agent Name');
+  if (code.length !== 6) return err('Invalid Lobby Code (6 chars)');
   try {
     const r = await api('join', { name, code });
     saveSession({ code: r.code, token: r.token, name });
     applyState(r.state);
   } catch (e) {
-    const m = { game_not_found: 'No game with that code', game_in_progress: 'That game already started',
-                game_full: 'That game is full (10 max)', name_taken: 'That name is taken in this room' };
+    const m = { game_not_found: 'Lobby not found', game_in_progress: 'Lobby already started',
+                game_full: 'Lobby full (10 max)', name_taken: 'Name taken in this lobby' };
     err(m[e.message] || e.message);
   }
 }
 async function resumeSession() {
   if (!session) return;
   try { applyState(await api('state', session)); }
-  catch (e) { saveSession(null); $('resumeHint').style.display = 'none'; alert('That game no longer exists.'); }
+  catch (e) { saveSession(null); $('resumeHint').style.display = 'none'; alert('Lobby expired.'); }
 }
 
 // ============================================================================
@@ -1230,7 +1282,7 @@ function renderLobby(s) {
   show('screen-lobby');
   $('lobbyCode').textContent = s.code;
   const joinUrl = location.origin + '/join?code=' + s.code;
-  $('qrWrap').innerHTML = `<img alt="QR" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(joinUrl)}">`;
+  $('qrWrap').innerHTML = `<img alt="QR" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&color=0f172a&bgcolor=ffffff&data=${encodeURIComponent(joinUrl)}">`;
   const list = $('lobbyPlayers');
   list.innerHTML = '';
   s.players.forEach(p => {
@@ -1238,13 +1290,13 @@ function renderLobby(s) {
     d.className = 'player-row' + (p.ready ? ' ready' : '');
     const mine = p.name === s.you.name;
     const kick = s.is_host && !mine && s.phase === 'lobby'
-      ? ` <button class="rec-clear" style="padding:2px 8px;font-size:0.7rem;" onclick="kickPlayer('${esc(p.name)}')">✕</button>` : '';
-    d.innerHTML = `<span>${esc(p.name)}${mine ? ' (you)' : ''}${p.name === s.host_name ? ' 👑' : ''}</span>
-                   <span class="tag">${p.ready ? '✅ ready' : '⏳ not ready'}${kick}</span>`;
+      ? ` <button class="rec-clear" style="padding:4px 10px;font-size:0.75rem;border-color:var(--neon-red);color:var(--neon-red);" onclick="kickPlayer('${esc(p.name)}')">✕</button>` : '';
+    d.innerHTML = `<span>${esc(p.name)}${mine ? ' (YOU)' : ''}${p.name === s.host_name ? ' 👑' : ''}</span>
+                   <span class="tag">${p.ready ? '✅ READY' : '⏳ WAIT'}${kick}</span>`;
     list.appendChild(d);
   });
-  $('lobbyProgress').textContent = `${s.players.length} player(s) — need 3+, up to 10`;
-  $('lobbyReadyBtn').textContent = s.you.ready ? 'Not ready' : "I'm ready";
+  $('lobbyProgress').textContent = `AGENTS: ${s.players.length} / 10 — MIN 3`;
+  $('lobbyReadyBtn').textContent = s.you.ready ? 'Stand Down' : "Ready Up";
   $('lobbyReadyBtn').className = s.you.ready ? 'secondary' : '';
   const n = s.players.length;
   const maxK = Math.max(1, Math.floor((n - 1) / 2));
@@ -1255,19 +1307,19 @@ function renderLobby(s) {
     sel.innerHTML = '';
     for (let k = 1; k <= Math.min(3, maxK); k++) {
       const opt = document.createElement('option');
-      opt.value = k; opt.textContent = k + ' imposter' + (k > 1 ? 's' : '');
+      opt.value = k; opt.textContent = k + ' Imposter' + (k > 1 ? 's' : '');
       sel.appendChild(opt);
     }
     sel.value = String(Math.min(s.imposter_count, Math.min(3, maxK)));
-    $('imposterNote').textContent = `Max ${maxK} with ${n} players.`;
+    $('imposterNote').textContent = `Max ${maxK} with ${n} agents.`;
   } else box.style.display = 'none';
   if (s.is_host) {
     $('lobbyStartBtn').style.display = 'block';
     const allReady = s.players.every(p => p.ready);
     $('lobbyStartBtn').disabled = !(n >= 3 && allReady);
     $('lobbyStartBtn').textContent = n < 3
-      ? `Need ${3 - n} more player(s)`
-      : (allReady ? '▶ Start game' : 'Waiting for everyone to be ready');
+      ? `Need ${3 - n} more agents`
+      : (allReady ? '▶ START PROTOCOL' : 'Waiting for ready status');
   } else $('lobbyStartBtn').style.display = 'none';
   $('chatFab').style.display = 'flex';
 }
@@ -1298,12 +1350,12 @@ function renderRevealOnline(s) {
   const card = $('revealCard');
   const isImp = !!s.you_are_imposter;
   card.className = 'role-card ' + (isImp ? 'imposter' : 'crew');
-  $('revealLabel').textContent = isImp ? 'You are an IMPOSTER!' : 'Your word';
+  $('revealLabel').textContent = isImp ? 'YOU ARE THE IMPOSTER' : 'YOUR SECRET WORD';
   $('revealWord').textContent = isImp ? '🤫' : (s.your_word || '—');
   $('revealHint').textContent = isImp
-    ? 'Hint: ' + (s.your_hint || '') + '\nBlend in!'
-    : 'Describe it without saying the word!';
-  $('revealRound').textContent = `ROLE REVEAL — ${s.imposter_count} IMPOSTER${s.imposter_count>1?'S':''}`;
+    ? 'HINT: ' + (s.your_hint || '') + '\nBLEND IN. DO NOT GET CAUGHT.'
+    : 'DESCRIBE IT WITHOUT SAYING THE WORD.';
+  $('revealRound').textContent = `ROLE REVEAL — ${s.imposter_count} IMPOSTER${s.imposter_count>1?'S':''} DETECTED`;
   $('revealNextBtn').style.display = s.is_host ? 'block' : 'none';
   $('revealLocalBtn').style.display = 'none';
   $('chatFab').style.display = 'flex';
@@ -1317,7 +1369,7 @@ function renderClue(s) {
   const submitted = s.you.clue || s.you.clue_audio;
   $('clueInput').disabled = !!submitted;
   $('clueSubmitBtn').disabled = !!submitted;
-  $('clueSubmitBtn').textContent = submitted ? 'Submitted ✅' : 'Submit written clue';
+  $('clueSubmitBtn').textContent = submitted ? 'Transmitted ✅' : 'Send Text';
   if (submitted && s.you.clue) $('clueInput').value = s.you.clue;
   $('voiceSubmitBtn').style.display = recordedAudioDataUrl && !submitted ? 'block' : 'none';
   $('voiceSubmitBtn').disabled = !!submitted;
@@ -1326,11 +1378,11 @@ function renderClue(s) {
   s.players.forEach(p => {
     const d = document.createElement('div');
     d.className = 'player-row';
-    d.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${p.has_clue ? '✅ done' : '✏️ thinking...'}</span>`;
+    d.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${p.has_clue ? '✅ SENT' : '✏️ INPUTTING...'}</span>`;
     wl.appendChild(d);
   });
   const done = s.players.filter(p => p.has_clue).length;
-  $('clueProgress').textContent = `${done} / ${s.players.length} submitted`;
+  $('clueProgress').textContent = `STATUS: ${done} / ${s.players.length} TRANSMITTED`;
   $('chatFab').style.display = submitted ? 'flex' : 'none';
   if (chatOpen && submitted) renderChat(s);
 }
@@ -1344,7 +1396,7 @@ function renderSummary(s) {
     const d = document.createElement('div');
     d.className = 'clue-item' + (p.name === s.you.name ? ' mine' : '');
     if (p.clue) d.innerHTML = `<span class="name">${esc(p.name)}:</span> ${esc(p.clue)}`;
-    else if (p.clue_audio) d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ voice
+    else if (p.clue_audio) d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ VOICE
       <button class="play-btn" onclick="playAudio('${p.clue_audio}')">▶ Play</button>`;
     else d.innerHTML = `<span class="name">${esc(p.name)}:</span> —`;
     list.appendChild(d);
@@ -1352,7 +1404,7 @@ function renderSummary(s) {
   const btn = $('summaryNextBtn');
   if (s.is_host) {
     btn.style.display = 'block';
-    btn.textContent = s.round === 1 ? 'Start Round 2 →' : 'Go to voting →';
+    btn.textContent = s.round === 1 ? 'Start Round 2 →' : 'Proceed to Voting →';
   } else btn.style.display = 'none';
   $('chatFab').style.display = 'flex';
 }
@@ -1363,13 +1415,13 @@ function renderVoteOnline(s) {
   const voted = s.you.has_voted;
   if (voted) selectedVote = null;
   $('voteSubmitBtn').disabled = !selectedVote || voted;
-  $('voteSubmitBtn').textContent = voted ? 'Vote locked ✅' : 'Lock in vote';
+  $('voteSubmitBtn').textContent = voted ? 'VOTE LOCKED ✅' : 'LOCK VOTE';
   const list = $('voteList');
   list.innerHTML = '';
   s.players.forEach(p => {
     const btn = document.createElement('button');
     btn.className = 'vote-btn' + (p.name === selectedVote ? ' selected' : '') + (voted ? ' done' : '');
-    btn.textContent = p.name + (p.name === s.you.name ? ' (you)' : '');
+    btn.textContent = p.name + (p.name === s.you.name ? ' (YOU)' : '');
     if (p.name === s.you.name) btn.disabled = true;
     else if (!voted) {
       btn.onclick = () => {
@@ -1386,7 +1438,7 @@ function renderVoteOnline(s) {
   s.players.forEach(p => {
     const d = document.createElement('div');
     d.className = 'player-row';
-    d.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${p.has_voted ? '✅ voted' : '⏳ waiting'}</span>`;
+    d.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${p.has_voted ? '✅ VOTED' : '⏳ WAITING'}</span>`;
     wl.appendChild(d);
   });
   $('voteChatHint').style.display = 'block';
@@ -1404,11 +1456,11 @@ function renderResult(s) {
   banner.textContent = title;
   banner.className = 'banner ' + cls;
   let detail = '';
-  if (s.vote_tie) detail += `The vote was a tie.<br>`;
-  else if (s.voted_out_name) detail += `Voted out: <strong>${esc(s.voted_out_name)}</strong>.<br>`;
-  detail += `Imposter${imposterNames.length>1?'s':''}: ` +
+  if (s.vote_tie) detail += `VOTE TIED.<br>`;
+  else if (s.voted_out_name) detail += `VOTED OUT: <strong>${esc(s.voted_out_name)}</strong><br>`;
+  detail += `IMPOSTER${imposterNames.length>1?'S':''}: ` +
             imposterNames.map(n => `<strong>${esc(n)}</strong>`).join(', ') +
-            `<br>Secret word: <strong>${esc(s.secret_word)}</strong>.`;
+            `<br>WORD: <strong>${esc(s.secret_word)}</strong>`;
   $('resultDetail').innerHTML = detail;
   const tally = s.vote_counts || {};
   const entries = Object.entries(tally).sort((a, b) => b[1] - a[1]);
@@ -1419,7 +1471,7 @@ function renderResult(s) {
     const row = document.createElement('div');
     row.className = 'vote-row' + (count === topCount && count > 0 && !s.vote_tie ? ' top' : '');
     row.innerHTML = `<span>${esc(name)}${imposterNames.includes(name) ? ' 🤫' : ''}</span>
-                     <span class="count">${count} vote${count === 1 ? '' : 's'}</span>`;
+                     <span class="count">${count} VOTE${count === 1 ? '' : 'S'}</span>`;
     box.appendChild(row);
   });
   $('imposterBox').innerHTML =
@@ -1429,22 +1481,22 @@ function renderResult(s) {
   const sortedScores = Object.entries(scores).sort((a, b) => b[1] - a[1]);
   const sb = $('scoreboard');
   if (sortedScores.length) {
-    sb.innerHTML = '<h4>🏆 Session scores</h4>' +
-      sortedScores.map(([n, v]) => `<div class="score-row"><span>${esc(n)}</span><span class="pts">${v} win${v===1?'':'s'}</span></div>`).join('');
+    sb.innerHTML = '<h4>SESSION SCORES</h4>' +
+      sortedScores.map(([n, v]) => `<div class="score-row"><span>${esc(n)}</span><span class="pts">${v} WIN${v===1?'':'S'}</span></div>`).join('');
   } else sb.innerHTML = '';
   const rc = $('resultClues');
-  rc.innerHTML = '<div class="round-header">ROUND 2 CLUES</div>';
+  rc.innerHTML = '<div class="round-header">ROUND 2 DATA</div>';
   s.players.forEach(p => {
     const d = document.createElement('div');
     d.className = 'clue-item' + (p.name === s.you.name ? ' mine' : '');
     if (p.clue) d.innerHTML = `<span class="name">${esc(p.name)}:</span> ${esc(p.clue)}`;
-    else if (p.clue_audio) d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ voice
+    else if (p.clue_audio) d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ VOICE
       <button class="play-btn" onclick="playAudio('${p.clue_audio}')">▶ Play</button>`;
     else d.innerHTML = `<span class="name">${esc(p.name)}:</span> —`;
     rc.appendChild(d);
   });
   $('playAgainBtn').style.display = s.is_host ? 'block' : 'none';
-  $('resultProgress').textContent = s.is_host ? '' : 'Waiting for host...';
+  $('resultProgress').textContent = s.is_host ? '' : 'WAITING FOR HOST...';
   $('chatFab').style.display = 'flex';
 }
 
@@ -1468,16 +1520,15 @@ async function hostAdvance() {
   catch (e) { alert(e.message); }
 }
 
-// dispatch to correct handler
 async function submitClue() {
   if (local) return localSubmitClue('text');
   if (!session) return;
   $('clueError').textContent = '';
   const text = $('clueInput').value.trim();
-  if (!text) { $('clueError').textContent = 'Please type a clue.'; return; }
+  if (!text) { $('clueError').textContent = 'ENTER A CLUE.'; return; }
   try { applyState(await api('clue', { ...session, text })); }
   catch (e) {
-    const m = { contains_word: '❌ Your clue contains the secret word!' };
+    const m = { contains_word: '❌ CLUE CONTAINS SECRET WORD!' };
     $('clueError').textContent = m[e.message] || e.message;
   }
 }
@@ -1489,7 +1540,7 @@ async function submitVoice() {
     applyState(await api('audio', { ...session, audio: recordedAudioDataUrl }));
     clearRecording();
   } catch (e) {
-    const m = { audio_too_large: 'Recording too large. Try a shorter clip.' };
+    const m = { audio_too_large: 'AUDIO TOO LARGE.' };
     $('clueError').textContent = m[e.message] || e.message;
   }
 }
@@ -1529,12 +1580,12 @@ function renderLocalNameInputs() {
   box.innerHTML = '';
   for (let i = 0; i < n; i++) {
     const label = document.createElement('label');
-    label.textContent = `Player ${i + 1}`;
+    label.textContent = `Agent ${i + 1}`;
     const inp = document.createElement('input');
     inp.type = 'text';
     inp.maxLength = 20;
-    inp.value = localNames[i] || `Player ${i + 1}`;
-    inp.placeholder = `Player ${i + 1}`;
+    inp.value = localNames[i] || `Agent ${i + 1}`;
+    inp.placeholder = `ENTER NAME...`;
     inp.oninput = () => { localNames[i] = inp.value; };
     localNames[i] = inp.value;
     box.appendChild(label);
@@ -1545,11 +1596,11 @@ function renderLocalNameInputs() {
   sel.innerHTML = '';
   for (let k = 1; k <= Math.min(3, maxK); k++) {
     const opt = document.createElement('option');
-    opt.value = k; opt.textContent = k + ' imposter' + (k > 1 ? 's' : '');
+    opt.value = k; opt.textContent = k + ' Imposter' + (k > 1 ? 's' : '');
     sel.appendChild(opt);
   }
   sel.value = String(Math.min(parseInt(sel.value, 10) || 1, Math.min(3, maxK)));
-  $('localImposterNote').textContent = `Max ${maxK} with ${n} players.`;
+  $('localImposterNote').textContent = `Max ${maxK} with ${n} agents.`;
 }
 
 $('localNumPlayers').addEventListener('input', renderLocalNameInputs);
@@ -1575,10 +1626,10 @@ async function ensureWordCache() {
 async function startLocalGame() {
   $('localError').textContent = '';
   const n = Math.max(3, Math.min(10, parseInt($('localNumPlayers').value, 10) || 4));
-  const names = localNames.slice(0, n).map((s, i) => (s || '').trim() || `Player ${i + 1}`);
+  const names = localNames.slice(0, n).map((s, i) => (s || '').trim() || `Agent ${i + 1}`);
   const lower = names.map(s => s.toLowerCase());
   if (new Set(lower).size !== lower.length) {
-    $('localError').textContent = 'Player names must be unique.';
+    $('localError').textContent = 'Agent names must be unique.';
     return;
   }
   const lang = $('localLang').value;
@@ -1588,7 +1639,7 @@ async function startLocalGame() {
 
   let bank;
   try { bank = await ensureWordCache(); }
-  catch (e) { $('localError').textContent = 'Could not load words.'; return; }
+  catch (e) { $('localError').textContent = 'Data link failed.'; return; }
 
   const entry = bank[Math.floor(Math.random() * bank.length)][lang];
   const imposterIndices = new Set();
@@ -1635,15 +1686,15 @@ function revealRole() {
   const isImp = p.isImposter;
   const card = $('revealCard');
   card.className = 'role-card ' + (isImp ? 'imposter' : 'crew');
-  $('revealLabel').textContent = isImp ? 'You are an IMPOSTER!' : 'Your word';
+  $('revealLabel').textContent = isImp ? 'YOU ARE THE IMPOSTER' : 'YOUR SECRET WORD';
   $('revealWord').textContent = isImp ? '🤫' : (local.word || '—');
   $('revealHint').textContent = isImp
-    ? 'Hint: ' + (local.imposterHint || '') + '\nBlend in!'
-    : 'Describe it without saying the word!';
-  $('revealRound').textContent = `ROLE REVEAL — ${local.numImposters} IMPOSTER${local.numImposters>1?'S':''}`;
+    ? 'HINT: ' + (local.imposterHint || '') + '\nBLEND IN. DO NOT GET CAUGHT.'
+    : 'DESCRIBE IT WITHOUT SAYING THE WORD.';
+  $('revealRound').textContent = `ROLE REVEAL — ${local.numImposters} IMPOSTER${local.numImposters>1?'S':''} DETECTED`;
   $('revealNextBtn').style.display = 'none';
   $('revealLocalBtn').style.display = 'block';
-  $('revealProgress').textContent = `Player ${local.passIndex + 1} of ${local.players.length}`;
+  $('revealProgress').textContent = `AGENT ${local.passIndex + 1} / ${local.players.length}`;
   show('screen-reveal');
 }
 
@@ -1674,7 +1725,7 @@ function localRenderClue() {
   $('clueInput').value = '';
   $('clueInput').disabled = false;
   $('clueSubmitBtn').disabled = false;
-  $('clueSubmitBtn').textContent = 'Submit written clue';
+  $('clueSubmitBtn').textContent = 'Send Text';
   $('voiceSubmitBtn').style.display = 'none';
   $('clueError').textContent = '';
 
@@ -1683,14 +1734,14 @@ function localRenderClue() {
   local.players.forEach((pl, i) => {
     const d = document.createElement('div');
     d.className = 'player-row';
-    let status = '⏳ waiting';
-    if (pl.clue || pl.clueAudio) status = '✅ done';
-    else if (i === local.clueIndex) status = '✏️ your turn';
+    let status = '⏳ WAITING';
+    if (pl.clue || pl.clueAudio) status = '✅ SENT';
+    else if (i === local.clueIndex) status = '✏️ YOUR TURN';
     d.innerHTML = `<span>${esc(pl.name)}</span><span class="tag">${status}</span>`;
     wl.appendChild(d);
   });
   const done = local.players.filter(pl => pl.clue || pl.clueAudio).length;
-  $('clueProgress').textContent = `${done} / ${local.players.length} submitted`;
+  $('clueProgress').textContent = `STATUS: ${done} / ${local.players.length} TRANSMITTED`;
   $('chatFab').style.display = 'none';
   show('screen-clue');
   setTimeout(() => $('clueInput').focus(), 100);
@@ -1706,17 +1757,17 @@ function localSubmitClue(kind) {
 
   if (kind === 'text') {
     const text = ($('clueInput').value || '').trim();
-    if (!text) { $('clueError').textContent = 'Please type a clue.'; return; }
+    if (!text) { $('clueError').textContent = 'ENTER A CLUE.'; return; }
     const w = (local.word || '').toLowerCase();
     if (w && text.toLowerCase().includes(w)) {
-      $('clueError').textContent = '❌ Your clue contains the secret word!';
+      $('clueError').textContent = '❌ CLUE CONTAINS SECRET WORD!';
       return;
     }
     p.clue = text;
     p.clueAudio = null;
   } else {
     if (!recordedAudioDataUrl) {
-      $('clueError').textContent = 'No recording yet — tap the mic first.';
+      $('clueError').textContent = 'NO AUDIO DETECTED.';
       return;
     }
     p.clue = '';
@@ -1745,13 +1796,13 @@ function localRenderSummary() {
     const d = document.createElement('div');
     d.className = 'clue-item';
     if (p.clue) d.innerHTML = `<span class="name">${esc(p.name)}:</span> ${esc(p.clue)}`;
-    else if (p.clueAudio) d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ voice
+    else if (p.clueAudio) d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ VOICE
       <button class="play-btn" onclick="playAudio('${p.clueAudio}')">▶ Play</button>`;
     else d.innerHTML = `<span class="name">${esc(p.name)}:</span> —`;
     list.appendChild(d);
   });
   $('summaryNextBtn').style.display = 'block';
-  $('summaryNextBtn').textContent = local.round === 1 ? 'Start Round 2 →' : 'Go to voting →';
+  $('summaryNextBtn').textContent = local.round === 1 ? 'Start Round 2 →' : 'Proceed to Voting →';
   show('screen-summary');
   $('chatFab').style.display = 'none';
 }
@@ -1785,7 +1836,7 @@ function localRenderVote() {
   $('voteVoterName').className = 'badge local';
   local.selectedVote = null;
   $('voteSubmitBtn').disabled = true;
-  $('voteSubmitBtn').textContent = 'Lock in vote';
+  $('voteSubmitBtn').textContent = 'LOCK VOTE';
   $('voteError').textContent = '';
   const list = $('voteList');
   list.innerHTML = '';
@@ -1807,9 +1858,9 @@ function localRenderVote() {
   local.players.forEach((p, i) => {
     const d = document.createElement('div');
     d.className = 'player-row';
-    let status = '⏳ waiting';
-    if (p.vote) status = '✅ voted';
-    else if (i === local.voteIndex) status = '✏️ your turn';
+    let status = '⏳ WAITING';
+    if (p.vote) status = '✅ VOTED';
+    else if (i === local.voteIndex) status = '✏️ YOUR TURN';
     d.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${status}</span>`;
     wl.appendChild(d);
   });
@@ -1858,29 +1909,29 @@ function localRenderResult() {
     banner === 'imposter' ? '😈 IMPOSTERS WIN!' : '🤝 TIE';
   $('resultBanner').className = 'banner ' + banner;
   let detail = '';
-  if (tie) detail += 'The vote was a tie.<br>';
-  else if (votedOut) detail += `Voted out: <strong>${esc(votedOut)}</strong>.<br>`;
-  detail += `Imposter${imposterNames.length>1?'s':''}: ` +
+  if (tie) detail += 'VOTE TIED.<br>';
+  else if (votedOut) detail += `VOTED OUT: <strong>${esc(votedOut)}</strong><br>`;
+  detail += `IMPOSTER${imposterNames.length>1?'S':''}: ` +
     imposterNames.map(n => `<strong>${esc(n)}</strong>`).join(', ') +
-    `<br>Secret word: <strong>${esc(local.word)}</strong>.`;
+    `<br>WORD: <strong>${esc(local.word)}</strong>`;
   $('resultDetail').innerHTML = detail;
   const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
   const topCount = entries.length ? entries[0][1] : 0;
   $('voteSummary').innerHTML = entries.map(([n, c]) =>
     `<div class="vote-row ${c === topCount && c > 0 && !tie ? 'top' : ''}">
        <span>${esc(n)}${imposterNames.includes(n) ? ' 🤫' : ''}</span>
-       <span class="count">${c} vote${c === 1 ? '' : 's'}</span></div>`
+       <span class="count">${c} VOTE${c === 1 ? '' : 'S'}</span></div>`
   ).join('');
   $('imposterBox').innerHTML =
     `<div class="round-header">IMPOSTER${imposterNames.length>1?'S':''}</div>` +
     imposterNames.map(n => `<span class="imposter-pill">🕵️ ${esc(n)}</span>`).join(' ');
   const sorted = [...local.players].sort((a, b) => b.score - a.score);
-  $('scoreboard').innerHTML = '<h4>🏆 Session scores</h4>' +
-    sorted.map(p => `<div class="score-row"><span>${esc(p.name)}</span><span class="pts">${p.score} win${p.score===1?'':'s'}</span></div>`).join('');
-  $('resultClues').innerHTML = '<div class="round-header">ROUND 2 CLUES</div>' +
+  $('scoreboard').innerHTML = '<h4>SESSION SCORES</h4>' +
+    sorted.map(p => `<div class="score-row"><span>${esc(p.name)}</span><span class="pts">${p.score} WIN${p.score===1?'':'S'}</span></div>`).join('');
+  $('resultClues').innerHTML = '<div class="round-header">ROUND 2 DATA</div>' +
     local.players.map(p =>
       p.clue ? `<div class="clue-item"><span class="name">${esc(p.name)}:</span> ${esc(p.clue)}</div>` :
-      p.clueAudio ? `<div class="clue-item"><span class="name">${esc(p.name)}:</span> 🎙️ voice
+      p.clueAudio ? `<div class="clue-item"><span class="name">${esc(p.name)}:</span> 🎙️ VOICE
         <button class="play-btn" onclick="playAudio('${p.clueAudio}')">▶ Play</button></div>` :
       `<div class="clue-item"><span class="name">${esc(p.name)}:</span> —</div>`
     ).join('');
@@ -1935,7 +1986,7 @@ function pickMimeType() {
 async function toggleRecording() {
   if (mediaRecorder && mediaRecorder.state === 'recording') return stopRecording();
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    $('clueError').textContent = 'Recording not supported on this browser.';
+    $('clueError').textContent = 'RECORDING UNSUPPORTED ON THIS DEVICE.';
     return;
   }
   try {
@@ -1972,7 +2023,7 @@ async function toggleRecording() {
       if (recordSeconds >= 10) stopRecording();
     }, 100);
   } catch (e) {
-    $('clueError').textContent = 'Mic permission denied or unavailable.';
+    $('clueError').textContent = 'MIC ACCESS DENIED.';
   }
 }
 
@@ -1981,7 +2032,7 @@ function stopRecording() {
   clearInterval(recordTimer);
   $('recBtn').classList.remove('recording');
   $('recBtn').textContent = '🎙️';
-  $('recInfo').innerHTML = 'Recorded! Tap ▶ to preview, or Clear to redo.';
+  $('recInfo').innerHTML = 'Audio captured. Tap ▶ to preview.';
 }
 
 function clearRecording() {
@@ -1990,7 +2041,7 @@ function clearRecording() {
   $('recPlayback').src = '';
   $('voiceSubmitBtn').style.display = 'none';
   $('recClearBtn').style.display = 'none';
-  $('recInfo').innerHTML = 'Tap the mic to record a voice clue.<br>Max 10 seconds.';
+  $('recInfo').innerHTML = 'Tap to record voice transmission.<br>Max 10 seconds.';
 }
 
 // ============================================================================
@@ -2045,9 +2096,9 @@ async function sendChat() {
     if (r && r.phase) applyState(r);
   } catch (e) {
     const m = {
-      chat_locked: 'Chat is locked.',
-      chat_blocked_during_clue: 'Submit your clue first!',
-      empty: 'Type a message first.',
+      chat_locked: 'COMMS LOCKED.',
+      chat_blocked_during_clue: 'SUBMIT CLUE FIRST!',
+      empty: 'TYPE MESSAGE.',
     };
     alert(m[e.message] || e.message);
   }
@@ -2059,13 +2110,13 @@ async function sendChat() {
 function toggleMenu() { $('menuPanel').classList.toggle('open'); }
 async function leaveGame() {
   if (!session) return;
-  if (!confirm('Leave this game?')) return;
+  if (!confirm('Disconnect from lobby?')) return;
   try { await api('leave', session); } catch (e) {}
   saveSession(null); stopPolling(); backToMode();
 }
 async function endGame() {
   if (!session) return;
-  if (!confirm('End game for everyone?')) return;
+  if (!confirm('Terminate lobby for all agents?')) return;
   try { await api('end', session); } catch (e) {}
   saveSession(null); stopPolling(); backToMode();
 }
