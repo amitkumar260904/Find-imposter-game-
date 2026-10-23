@@ -9,7 +9,6 @@ import secrets
 import time
 import string
 import urllib.parse
-import base64
 import signal
 import sys
 
@@ -17,7 +16,7 @@ PORT = int(os.environ.get("PORT", 8000))
 START_TIME = time.time()
 
 # ===========================================================================
-# WORD BANK (your original 50 entries — unchanged)
+# WORD BANK
 # ===========================================================================
 WORD_BANK = [
     {"en": {"word": "Mobile Phone", "imposter_hint": "It is an electronic gadget used daily."},
@@ -123,26 +122,21 @@ WORD_BANK = [
 ]
 
 # ===========================================================================
-# STATE
+# STATE & HELPERS
 # ===========================================================================
 GAMES = {}
 GAMES_LOCK = threading.Lock()
 GAME_TTL_SECONDS = 3 * 60 * 60
-MAX_VOICE_BYTES = 60_000          # ~10s webm/opus mono ≈ 20-40KB
-MAX_CLIP_COUNT = 4                # per player per game
+MAX_VOICE_BYTES = 60_000
 MAX_CHAT_LEN = 200
 MAX_CHAT_HISTORY = 200
 
-# ===========================================================================
-# HELPERS
-# ===========================================================================
 def _cleanup_stale_games():
     now = time.time()
     with GAMES_LOCK:
         stale = [c for c, g in GAMES.items() if now - g["last_activity"] > GAME_TTL_SECONDS]
         for c in stale:
             del GAMES[c]
-
 
 def _new_code():
     alphabet = string.ascii_uppercase + string.digits
@@ -151,15 +145,13 @@ def _new_code():
         if code not in GAMES:
             return code
 
-
 def _make_player(token, name):
     return {
         "token": token, "name": name, "joined_at": time.time(),
         "role_word": "", "role_hint": "", "is_imposter": False,
         "clue": "", "clue_audio": None, "vote": None, "ready": False,
-        "score": 0, "connected": True,
+        "score": 0,
     }
-
 
 def _tally_votes(game):
     counts = {p["name"]: 0 for p in game["players"]}
@@ -171,7 +163,6 @@ def _tally_votes(game):
     if len(leaders) == 1:
         return leaders[0], False, counts
     return None, True, counts
-
 
 def _public_state(game, token):
     players = []
@@ -191,24 +182,20 @@ def _public_state(game, token):
     me = next((p for p in game["players"] if p["token"] == token), None)
     host = next((p for p in game["players"] if p["token"] == game["host_token"]), None)
     state = {
-        "code": game["code"],
-        "phase": game["phase"],
-        "lang": game["lang"],
-        "round": game["round"],
-        "players": players,
+        "code": game["code"], "phase": game["phase"], "lang": game["lang"],
+        "round": game["round"], "players": players,
         "is_host": bool(me and me["token"] == game["host_token"]),
         "host_name": host["name"] if host else "",
         "imposter_count": game["imposter_count"],
-        "chat": game.get("chat", [])[-60:],           # last 60 messages
+        "chat": game.get("chat", [])[-60:],
         "chat_open": game.get("chat_open", True),
+        "reactions": game.get("reactions", []),
         "you": None,
     }
     if me:
         state["you"] = {
-            "name": me["name"],
-            "ready": me["ready"],
-            "clue": me["clue"],
-            "clue_audio": me.get("clue_audio"),
+            "name": me["name"], "ready": me["ready"],
+            "clue": me["clue"], "clue_audio": me.get("clue_audio"),
             "has_voted": me["vote"] is not None,
             "score": me.get("score", 0),
         }
@@ -265,16 +252,12 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path in ("/", "/index.html"):
             self._send(200, HTML_PAGE, "text/html; charset=utf-8")
-        elif path == "/manifest.json":
-            self._send(200, MANIFEST_JSON, "application/manifest+json; charset=utf-8")
-        elif path == "/sw.js":
-            self._send(200, SW_JS, "application/javascript; charset=utf-8")
-        elif path == "/icon.svg":
-            self._send(200, ICON_SVG, "image/svg+xml; charset=utf-8")
         elif path == "/api/ping":
             self._json(200, {"ok": True, "games": len(GAMES), "ts": int(time.time())})
         elif path in ("/health", "/healthz"):
             self._json(200, {"status": "ok", "games": len(GAMES), "uptime": int(time.time() - START_TIME)})
+        elif path == "/api/words":
+            self._json(200, {"words": WORD_BANK})
         elif path == "/join":
             qs = urllib.parse.urlparse(self.path).query
             self.send_response(302)
@@ -297,6 +280,7 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             "/api/vote": self._handle_vote,
             "/api/reset": self._handle_reset,
             "/api/chat": self._handle_chat,
+            "/api/react": self._handle_react,
             "/api/leave": self._handle_leave,
             "/api/kick": self._handle_kick,
             "/api/end": self._handle_end,
@@ -314,12 +298,13 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    # ---------------------------------------------------------------- util
     def _with_game(self, payload, fn):
         if not payload:
-            return self._json(400, {"error": "bad request"})
+            return self._json(400, {"error": "bad_request"})
         code = (payload.get("code") or "").upper().strip()
         token = payload.get("token") or ""
+        if not code or not token:
+            return self._json(400, {"error": "missing_code_or_token"})
         _cleanup_stale_games()
         with GAMES_LOCK:
             game = GAMES.get(code)
@@ -334,14 +319,13 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
         return next((p for p in game["players"] if p["token"] == token), None)
 
     def _add_chat(self, game, sender_name, text):
-        text = (text or "").strip()[:MAX_CHAT_LEN]
+        text = str(text or "").strip()[:MAX_CHAT_LEN]
         if not text:
             return
         entry = {"ts": int(time.time() * 1000), "name": sender_name, "text": text}
         game.setdefault("chat", []).append(entry)
         game["chat"] = game["chat"][-MAX_CHAT_HISTORY:]
 
-    # ------------------------------------------------------------- create
     def _handle_create(self):
         payload = self._read_json() or {}
         lang = payload.get("lang", "en")
@@ -352,20 +336,19 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
         with GAMES_LOCK:
             code = _new_code()
             GAMES[code] = {
-                "code": code, "lang": lang, "phase": "lobby",
-                "host_token": token,
+                "code": code, "lang": lang, "phase": "lobby", "host_token": token,
                 "players": [_make_player(token, name)],
                 "word": "", "imposter_hint": "", "imposter_index": 0,
                 "imposter_count": 1, "imposter_names": [],
                 "result_banner": "", "vote_counts": {},
                 "voted_out_name": None, "vote_tie": False,
                 "round": 1, "chat": [], "chat_open": True,
+                "reactions": [],
                 "created_at": time.time(), "last_activity": time.time(),
             }
             game = GAMES[code]
         self._json(200, {"code": code, "token": token, "state": _public_state(game, token)})
 
-    # --------------------------------------------------------------- join
     def _handle_join(self):
         payload = self._read_json() or {}
         code = (payload.get("code") or "").upper().strip()
@@ -387,26 +370,21 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             self._add_chat(game, "System", f"{name} joined the room")
         self._json(200, {"code": code, "token": token, "state": _public_state(game, token)})
 
-    # -------------------------------------------------------------- state
     def _handle_state(self):
         payload = self._read_json() or {}
         self._with_game(payload, lambda g, t, p: self._json(200, _public_state(g, t)))
 
     def _handle_ready(self):
         payload = self._read_json() or {}
-
         def run(game, token, payload):
             me = self._find_player(game, token)
             me["ready"] = bool(payload.get("ready", True))
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # -------------------------------------------------------------- start
     def _handle_start(self):
         payload = self._read_json() or {}
         num_imposters = payload.get("num_imposters", 1)
-
         def run(game, token, payload):
             if token != game["host_token"]:
                 return self._json(403, {"error": "host_only"})
@@ -445,16 +423,14 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             game["vote_counts"] = {}
             game["voted_out_name"] = None
             game["vote_tie"] = False
+            game["reactions"] = []
             self._add_chat(game, "System", "Game started! Check your secret role.")
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # --------------------------------------------------------------- clue
     def _handle_clue(self):
         payload = self._read_json() or {}
         text = (payload.get("text") or "").strip()[:80]
-
         def run(game, token, payload):
             if game["phase"] != "clue":
                 return self._json(409, {"error": "not_clue_phase"})
@@ -463,21 +439,17 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "empty_clue"})
             if me["clue"] or me.get("clue_audio"):
                 return self._json(409, {"error": "already_submitted"})
-            # reject clue that contains the actual word (basic anti-cheat)
             if game["word"] and game["word"].lower() in text.lower():
                 return self._json(400, {"error": "contains_word"})
             me["clue"] = text
             if all(p["clue"] or p.get("clue_audio") for p in game["players"]):
                 game["phase"] = "summary"
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # -------------------------------------------------------------- audio
     def _handle_audio(self):
         payload = self._read_json() or {}
         data = payload.get("audio") or ""
-
         def run(game, token, payload):
             if game["phase"] != "clue":
                 return self._json(409, {"error": "not_clue_phase"})
@@ -489,17 +461,14 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             if len(data) > MAX_VOICE_BYTES:
                 return self._json(413, {"error": "audio_too_large"})
             me["clue_audio"] = data
-            me["clue"] = ""   # voice replaces text
+            me["clue"] = ""
             if all(p["clue"] or p.get("clue_audio") for p in game["players"]):
                 game["phase"] = "summary"
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # ------------------------------------------------------------ advance
     def _handle_advance(self):
         payload = self._read_json() or {}
-
         def run(game, token, payload):
             if token != game["host_token"]:
                 return self._json(403, {"error": "host_only"})
@@ -520,15 +489,13 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                     game["phase"] = "vote"
                     for p in game["players"]:
                         p["vote"] = None
+            game["reactions"] = []
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # --------------------------------------------------------------- vote
     def _handle_vote(self):
         payload = self._read_json() or {}
         target = payload.get("target")
-
         def run(game, token, payload):
             if game["phase"] != "vote":
                 return self._json(409, {"error": "not_vote_phase"})
@@ -546,17 +513,12 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                 game["vote_tie"] = is_tie
                 game["voted_out_name"] = top_name
                 imposter_names = set(game["imposter_names"])
-                crew_count = len(game["players"]) - len(imposter_names)
                 if is_tie:
                     game["result_banner"] = "imposter"
                 elif top_name in imposter_names:
-                    if len(imposter_names) == 1:
-                        game["result_banner"] = "crew"
-                    else:
-                        game["result_banner"] = "imposter"
+                    game["result_banner"] = "crew" if len(imposter_names) == 1 else "imposter"
                 else:
                     game["result_banner"] = "imposter"
-                # scoring
                 if game["result_banner"] == "crew":
                     for p in game["players"]:
                         if not p["is_imposter"]:
@@ -568,14 +530,10 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                 self._add_chat(game, "System",
                     "Crew wins!" if game["result_banner"] == "crew" else "Imposters win!")
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
-    # -------------------------------------------------------------- reset
     def _handle_reset(self):
-        """Back to lobby, keep same players and scores."""
         payload = self._read_json() or {}
-
         def run(game, token, payload):
             if token != game["host_token"]:
                 return self._json(403, {"error": "host_only"})
@@ -590,6 +548,7 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             game["voted_out_name"] = None
             game["vote_tie"] = False
             game["chat_open"] = True
+            game["reactions"] = []
             for p in game["players"]:
                 p["clue"] = ""
                 p["clue_audio"] = None
@@ -600,11 +559,9 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                 p["role_hint"] = ""
             self._add_chat(game, "System", "New game ready — everyone, please ready up.")
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
     def _handle_end(self):
-        """Delete the game entirely. Host only. All other players lose the room."""
         payload = self._read_json() or {}
         code = (payload.get("code") or "").upper().strip()
         token = payload.get("token") or ""
@@ -617,28 +574,43 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             del GAMES[code]
         self._json(200, {"ok": True})
 
-    # --------------------------------------------------------------- chat
     def _handle_chat(self):
         payload = self._read_json() or {}
-        text = payload.get("text") or ""
-
+        
         def run(game, token, payload):
+            raw_text = payload.get("text", "")
+            text = str(raw_text).strip()[:MAX_CHAT_LEN]
             if not game.get("chat_open", True):
                 return self._json(403, {"error": "chat_locked"})
             me = self._find_player(game, token)
-            if not text.strip():
+            if not me:
+                return self._json(403, {"error": "not_in_game"})
+            if not text:
                 return self._json(400, {"error": "empty"})
-            if len(text) > MAX_CHAT_LEN:
-                text = text[:MAX_CHAT_LEN]
-            # only allow chat in safe phases (not mid-clue-submission)
             if game["phase"] == "clue" and not (me["clue"] or me.get("clue_audio")):
                 return self._json(403, {"error": "chat_blocked_during_clue"})
+            
             self._add_chat(game, me["name"], text)
             self._json(200, _public_state(game, token))
 
         self._with_game(payload, run)
 
-    # -------------------------------------------------------------- leave
+    def _handle_react(self):
+        payload = self._read_json() or {}
+        emoji = payload.get("emoji", "")
+        def run(game, token, payload):
+            me = self._find_player(game, token)
+            if emoji:
+                game.setdefault("reactions", []).append({
+                    "emoji": emoji,
+                    "name": me["name"],
+                    "ts": time.time()
+                })
+                now = time.time()
+                game["reactions"] = [r for r in game["reactions"] if now - r["ts"] < 3.0]
+            self._json(200, {"ok": True})
+        self._with_game(payload, run)
+
     def _handle_leave(self):
         payload = self._read_json() or {}
         code = (payload.get("code") or "").upper().strip()
@@ -652,28 +624,22 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True})
             game["players"].remove(me)
             self._add_chat(game, "System", f"{me['name']} left the room")
-            # host transfer
             if me["token"] == game["host_token"] and game["players"]:
                 game["host_token"] = game["players"][0]["token"]
                 self._add_chat(game, "System",
                     f"{game['players'][0]['name']} is now the host")
-            # empty game → delete
             if not game["players"]:
                 del GAMES[code]
-            # if enough players left → auto-reset to lobby
-            elif len(game["players"]) < 3 and game["phase"] not in ("lobby",):
+            elif len(game["players"]) < 3 and game["phase"] != "lobby":
                 game["phase"] = "lobby"
                 for p in game["players"]:
                     p["ready"] = False
-                self._add_chat(game, "System",
-                    "Not enough players — game reset to lobby")
+                self._add_chat(game, "System", "Not enough players — game reset to lobby")
         self._json(200, {"ok": True})
 
-    # --------------------------------------------------------------- kick
     def _handle_kick(self):
         payload = self._read_json() or {}
         target = payload.get("target") or ""
-
         def run(game, token, payload):
             if token != game["host_token"]:
                 return self._json(403, {"error": "host_only"})
@@ -687,496 +653,681 @@ class GameHandler(http.server.BaseHTTPRequestHandler):
             game["players"].remove(victim)
             self._add_chat(game, "System", f"{target} was removed by the host")
             self._json(200, _public_state(game, token))
-
         self._with_game(payload, run)
 
 
 # ===========================================================================
-# HTML (SPA)
+# HTML (GAME ARENA THEME + TUTORIAL + REACTIONS + ANIMATED BG)
 # ===========================================================================
-
-MANIFEST_JSON = json.dumps({
-    "name": "Imposter Protocol",
-    "short_name": "Imposter",
-    "start_url": "/",
-    "display": "standalone",
-    "background_color": "#1e1b4b",
-    "theme_color": "#4f46e5",
-    "orientation": "portrait-primary",
-    "description": "Multiplayer party word game: find who the imposter is!",
-    "icons": [
-        {
-            "src": "/icon.svg",
-            "sizes": "192x192 512x512",
-            "type": "image/svg+xml",
-            "purpose": "any maskable"
-        }
-    ]
-}, indent=2)
-
-ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#1e1b4b"/>
-      <stop offset="50%" stop-color="#312e81"/>
-      <stop offset="100%" stop-color="#4c1d95"/>
-    </linearGradient>
-    <linearGradient id="glow" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#818cf8"/>
-      <stop offset="100%" stop-color="#c084fc"/>
-    </linearGradient>
-  </defs>
-  <rect width="512" height="512" rx="115" fill="url(#bg)"/>
-  <circle cx="256" cy="256" r="195" fill="none" stroke="url(#glow)" stroke-width="8" opacity="0.35"/>
-  <text x="50%" y="52%" font-size="210" text-anchor="middle" dominant-baseline="middle">🕵️</text>
-  <text x="50%" y="82%" font-size="44" font-weight="900" font-family="system-ui, -apple-system, sans-serif" fill="#f8fafc" text-anchor="middle" letter-spacing="3">IMPOSTER</text>
-</svg>"""
-
-SW_JS = """const CACHE_NAME = 'imposter-proto-v1';
-const ASSETS = ['/', '/manifest.json', '/icon.svg'];
-
-self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS)));
-  self.skipWaiting();
-});
-
-self.addEventListener('activate', (e) => {
-  e.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.map((k) => k !== CACHE_NAME && caches.delete(k)))
-    )
-  );
-  self.clients.claim();
-});
-
-self.addEventListener('fetch', (e) => {
-  if (e.request.method !== 'GET') return;
-  e.respondWith(
-    fetch(e.request).catch(() => caches.match(e.request))
-  );
-});
-"""
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<meta name="theme-color" content="#4f46e5">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="manifest" href="/manifest.json">
-<link rel="icon" type="image/svg+xml" href="/icon.svg">
-<link rel="apple-touch-icon" href="/icon.svg">
-<title>Imposter Word — Multiplayer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Imposter Protocol</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    background: linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #4c1d95 100%);
-    color: #f8fafc; min-height: 100vh;
-    display: flex; align-items: flex-start; justify-content: center; padding: 16px;
-    padding-bottom: 90px;
+  @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap');
+
+  :root {
+    --bg-base: #05050f;
+    --bg-card: rgba(15, 17, 30, 0.85);
+    --neon-cyan: #00f3ff;
+    --neon-purple: #b026ff;
+    --neon-red: #ff003c;
+    --neon-green: #00ff66;
+    --text-main: #e2e8f0;
+    --text-muted: #94a3b8;
+    --font-ui: 'Rajdhani', sans-serif;
+    --font-mono: 'Share Tech Mono', monospace;
   }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  
+  body {
+    font-family: var(--font-ui);
+    background-color: var(--bg-base);
+    background-image: 
+      linear-gradient(rgba(0, 243, 255, 0.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 243, 255, 0.05) 1px, transparent 1px);
+    background-size: 30px 30px;
+    color: var(--text-main); 
+    min-height: 100vh;
+    display: flex; align-items: flex-start; justify-content: center; 
+    padding: 16px;
+    padding-bottom: 90px;
+    overflow-x: hidden;
+  }
+
+  /* Scanline effect */
+  body::after {
+    content: " ";
+    display: block;
+    position: fixed;
+    top: 0; left: 0; bottom: 0; right: 0;
+    background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+    z-index: 2;
+    background-size: 100% 2px, 3px 100%;
+    pointer-events: none;
+  }
+
   .app {
     width: 100%; max-width: 540px;
-    background: rgba(15, 23, 42, 0.85);
-    border: 1px solid rgba(148, 163, 184, 0.25);
-    border-radius: 20px; padding: 24px 20px;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.5); backdrop-filter: blur(8px);
+    background: var(--bg-card);
+    border: 1px solid rgba(0, 243, 255, 0.3);
+    border-radius: 16px; padding: 28px 24px;
+    box-shadow: 0 0 20px rgba(0, 243, 255, 0.1), inset 0 0 20px rgba(0, 243, 255, 0.05);
+    backdrop-filter: blur(10px);
     margin: auto;
+    position: relative;
+    z-index: 5;
   }
-  h1 { font-size: 1.5rem; text-align: center; margin-bottom: 4px; }
-  h2 { font-size: 1.15rem; text-align: center; margin-bottom: 6px; }
-  .subtitle { text-align: center; color: #94a3b8; font-size: 0.88rem; margin-bottom: 16px; line-height: 1.45; }
+
+  .app::before {
+    content: '';
+    position: absolute;
+    top: -1px; left: -1px; right: -1px; bottom: -1px;
+    border-radius: 16px;
+    pointer-events: none;
+    border: 1px solid transparent;
+    background: linear-gradient(135deg, var(--neon-cyan) 0%, transparent 40%, transparent 60%, var(--neon-purple) 100%) border-box;
+    -webkit-mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: destination-out;
+    mask-composite: exclude;
+  }
+
+  h1 { 
+    font-size: 2rem; text-align: center; margin-bottom: 4px; 
+    text-transform: uppercase; letter-spacing: 2px;
+    color: #fff;
+    text-shadow: 0 0 10px var(--neon-cyan), 0 0 20px var(--neon-cyan);
+  }
+  h2 { 
+    font-size: 1.3rem; text-align: center; margin-bottom: 8px; 
+    text-transform: uppercase; letter-spacing: 1px; color: var(--neon-cyan);
+  }
+  .subtitle { text-align: center; color: var(--text-muted); font-size: 0.95rem; margin-bottom: 20px; font-family: var(--font-mono); }
+  
   .screen { display: none; }
-  .screen.active { display: block; animation: fade 0.25s ease; }
-  @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
-  label { display: block; font-size: 0.85rem; color: #cbd5e1; margin-bottom: 6px; margin-top: 14px; }
+  .screen.active { display: block; animation: glitch-in 0.3s ease; }
+  @keyframes glitch-in { 
+    0% { opacity: 0; transform: translateY(10px) scale(0.98); filter: blur(4px); } 
+    100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); } 
+  }
+
+  label { display: block; font-size: 0.9rem; color: var(--neon-cyan); margin-bottom: 6px; margin-top: 16px; text-transform: uppercase; letter-spacing: 1px; }
+  
   select, input[type="text"] {
-    width: 100%; padding: 12px; border-radius: 10px;
-    border: 1px solid #475569; background: #1e293b; color: #f8fafc; font-size: 1rem;
+    width: 100%; padding: 14px; border-radius: 8px;
+    border: 1px solid rgba(0, 243, 255, 0.4); 
+    background: rgba(0, 0, 0, 0.5); 
+    color: var(--text-main); font-size: 1.1rem; font-family: var(--font-mono);
+    transition: all 0.2s;
   }
-  input[type="text"]:focus, select:focus { outline: 2px solid #6366f1; }
+  input[type="text"]:focus, select:focus { 
+    outline: none; border-color: var(--neon-cyan);
+    box-shadow: 0 0 15px rgba(0, 243, 255, 0.3);
+  }
+
   button {
-    width: 100%; padding: 14px; margin-top: 14px; border: none;
-    border-radius: 12px; background: linear-gradient(135deg, #6366f1, #8b5cf6);
-    color: white; font-size: 1rem; font-weight: 600; cursor: pointer;
-    transition: transform 0.1s, opacity 0.2s;
+    width: 100%; padding: 16px; margin-top: 16px; border: none;
+    border-radius: 8px; 
+    background: rgba(0, 243, 255, 0.1);
+    border: 1px solid var(--neon-cyan);
+    color: var(--neon-cyan); 
+    font-family: var(--font-ui); font-size: 1.1rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+    cursor: pointer;
+    transition: all 0.2s;
+    box-shadow: 0 0 10px rgba(0, 243, 255, 0.1);
   }
-  button:hover { transform: translateY(-1px); opacity: 0.95; }
-  button:active { transform: translateY(1px); }
-  button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-  button.secondary { background: #334155; }
-  button.danger { background: #b91c1c; }
-  .role-card { text-align: center; padding: 28px 16px; border-radius: 16px; margin-top: 14px; }
-  .role-card.crew { background: rgba(34, 197, 94, 0.15); border: 1px solid rgba(34,197,94,0.4); }
-  .role-card.imposter { background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239,68,68,0.4); }
-  .role-label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; color: #94a3b8; }
-  .role-word { font-size: 1.8rem; font-weight: 700; margin: 14px 0; word-break: break-word; }
-  .role-card.crew .role-word { color: #86efac; }
-  .role-card.imposter .role-word { color: #fca5a5; }
-  .role-hint { font-size: 0.9rem; color: #cbd5e1; line-height: 1.4; white-space: pre-line; }
-  .progress { text-align: center; font-size: 0.8rem; color: #94a3b8; margin-top: 12px; }
-  .vote-list { display: grid; gap: 10px; margin-top: 14px; }
-  .vote-btn { margin-top: 0; background: #1e293b; border: 1px solid #475569; font-weight: 500; text-align: left; padding-left: 18px; }
-  .vote-btn:hover { background: #334155; }
-  .vote-btn.selected { background: #6366f1; border-color: #818cf8; }
-  .vote-btn.done { opacity: 0.55; }
-  .result-title { text-align: center; font-size: 1.35rem; margin-bottom: 10px; line-height: 1.3; }
-  .result-detail { text-align: center; color: #cbd5e1; font-size: 0.95rem; line-height: 1.7; margin-top: 12px; }
-  .result-detail strong { color: #f8fafc; }
-  .clue-item { padding: 10px 14px; background: #1e293b; border-radius: 10px; font-size: 0.9rem; color: #cbd5e1; line-height: 1.4; }
-  .clue-item .name { color: #818cf8; font-weight: 600; }
-  .clue-item.mine { border: 1px solid #6366f1; }
-  .clue-item .play-btn { margin-top: 6px; padding: 6px 12px; font-size: 0.8rem; width: auto; background: #4f46e5; }
-  .round-header { text-align: center; margin: 4px 0 10px; font-size: 0.92rem; color: #a5b4fc; font-weight: 600; letter-spacing: 0.5px; }
-  .error { color: #fca5a5; text-align: center; font-size: 0.85rem; margin-top: 10px; min-height: 1em; }
-  .vote-summary { margin-top: 16px; display: grid; gap: 6px; }
-  .vote-row { display: flex; justify-content: space-between; padding: 8px 12px; background: #1e293b;
-              border-radius: 8px; font-size: 0.9rem; color: #cbd5e1; }
-  .vote-row .count { color: #a5b4fc; font-weight: 600; }
-  .vote-row.top { border: 1px solid #6366f1; }
-  .code-box { text-align: center; font-size: 2rem; font-weight: 800; letter-spacing: 6px;
-              color: #a5b4fc; background: #1e293b; padding: 14px; border-radius: 12px;
-              border: 1px dashed #6366f1; margin: 14px 0; user-select: all; }
-  .players-list { display: grid; gap: 8px; margin-top: 12px; }
-  .player-row { display: flex; justify-content: space-between; align-items: center;
-                padding: 10px 14px; background: #1e293b; border-radius: 10px; font-size: 0.92rem; }
-  .player-row .tag { font-size: 0.75rem; color: #94a3b8; }
-  .player-row.ready { border-left: 3px solid #22c55e; }
-  .tabs { display: flex; gap: 8px; margin-top: 12px; }
+  button:hover:not(:disabled) { 
+    background: rgba(0, 243, 255, 0.2); 
+    box-shadow: 0 0 20px rgba(0, 243, 255, 0.4);
+    transform: translateY(-2px);
+  }
+  button:active:not(:disabled) { transform: translateY(0); }
+  button:disabled { opacity: 0.3; cursor: not-allowed; border-color: var(--text-muted); color: var(--text-muted); box-shadow: none; }
+  
+  button.secondary { border-color: var(--text-muted); color: var(--text-muted); background: rgba(148, 163, 184, 0.1); }
+  button.secondary:hover:not(:disabled) { border-color: #fff; color: #fff; box-shadow: 0 0 15px rgba(255, 255, 255, 0.2); }
+  button.danger { border-color: var(--neon-red); color: var(--neon-red); background: rgba(255, 0, 60, 0.1); }
+  button.danger:hover:not(:disabled) { background: rgba(255, 0, 60, 0.2); box-shadow: 0 0 20px rgba(255, 0, 60, 0.4); }
+  button.big { padding: 24px 16px; font-size: 1.2rem; }
+
+  .mode-grid { display: grid; gap: 16px; margin-top: 24px; }
+  .mode-card {
+    background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(176, 38, 255, 0.4);
+    border-radius: 12px; padding: 20px; cursor: pointer; text-align: left;
+    transition: all 0.2s; color: var(--text-main);
+    position: relative; overflow: hidden;
+  }
+  .mode-card::before {
+    content: ''; position: absolute; top: 0; left: 0; width: 4px; height: 100%;
+    background: var(--neon-purple); transition: width 0.2s;
+  }
+  .mode-card:hover { 
+    border-color: var(--neon-purple); 
+    box-shadow: 0 0 15px rgba(176, 38, 255, 0.2);
+    transform: translateX(4px);
+  }
+  .mode-card:hover::before { width: 100%; opacity: 0.1; }
+  .mode-card .icon { font-size: 2rem; margin-bottom: 8px; }
+  .mode-card .title { font-size: 1.2rem; font-weight: 700; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 1px; color: #fff; }
+  .mode-card .desc { font-size: 0.9rem; color: var(--text-muted); line-height: 1.4; }
+
+  .role-card { 
+    text-align: center; padding: 32px 20px; border-radius: 12px; margin-top: 16px; 
+    position: relative; border: 1px solid;
+  }
+  .role-card.crew { border-color: var(--neon-green); background: rgba(0, 255, 102, 0.05); box-shadow: inset 0 0 30px rgba(0, 255, 102, 0.1); }
+  .role-card.imposter { border-color: var(--neon-red); background: rgba(255, 0, 60, 0.05); box-shadow: inset 0 0 30px rgba(255, 0, 60, 0.1); }
+  .role-label { font-size: 0.9rem; text-transform: uppercase; letter-spacing: 2px; color: var(--text-muted); font-family: var(--font-mono); }
+  .role-word { font-size: 2.2rem; font-weight: 700; margin: 16px 0; word-break: break-word; text-transform: uppercase; letter-spacing: 2px; }
+  .role-card.crew .role-word { color: var(--neon-green); text-shadow: 0 0 15px rgba(0, 255, 102, 0.5); }
+  .role-card.imposter .role-word { color: var(--neon-red); text-shadow: 0 0 15px rgba(255, 0, 60, 0.5); }
+  .role-hint { font-size: 0.95rem; color: var(--text-main); line-height: 1.5; white-space: pre-line; font-family: var(--font-mono); }
+
+  .progress { text-align: center; font-size: 0.85rem; color: var(--neon-purple); margin-top: 16px; font-family: var(--font-mono); letter-spacing: 1px; }
+  
+  .vote-list { display: grid; gap: 12px; margin-top: 16px; }
+  .vote-btn { 
+    margin-top: 0; background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(0, 243, 255, 0.3); 
+    color: var(--text-main); text-align: left; padding: 16px; border-radius: 8px;
+    font-family: var(--font-mono); font-size: 1rem; text-transform: uppercase;
+  }
+  .vote-btn:hover:not(:disabled) { border-color: var(--neon-cyan); background: rgba(0, 243, 255, 0.1); color: var(--neon-cyan); }
+  .vote-btn.selected { border-color: var(--neon-cyan); background: rgba(0, 243, 255, 0.15); color: #fff; box-shadow: 0 0 15px rgba(0, 243, 255, 0.3); }
+  .vote-btn.done { opacity: 0.5; border-style: dashed; }
+
+  .result-detail { text-align: center; color: var(--text-main); font-size: 1rem; line-height: 1.8; margin-top: 16px; font-family: var(--font-mono); }
+  .result-detail strong { color: #fff; text-shadow: 0 0 5px rgba(255,255,255,0.5); }
+  
+  .clue-item { padding: 12px 16px; background: rgba(0, 0, 0, 0.4); border-radius: 8px; font-size: 0.95rem; color: var(--text-main); line-height: 1.5; border-left: 2px solid var(--neon-purple); font-family: var(--font-mono); }
+  .clue-item .name { color: var(--neon-purple); font-weight: 600; text-transform: uppercase; }
+  .clue-item.mine { border-left-color: var(--neon-cyan); }
+  .clue-item .play-btn { margin-top: 8px; padding: 6px 12px; font-size: 0.8rem; width: auto; background: rgba(0, 243, 255, 0.1); border: 1px solid var(--neon-cyan); color: var(--neon-cyan); }
+
+  .round-header { text-align: center; margin: 8px 0 12px; font-size: 0.9rem; color: var(--neon-cyan); font-weight: 600; letter-spacing: 2px; text-transform: uppercase; font-family: var(--font-mono); }
+  .error { color: var(--neon-red); text-align: center; font-size: 0.9rem; margin-top: 12px; min-height: 1em; font-family: var(--font-mono); text-shadow: 0 0 5px rgba(255, 0, 60, 0.5); }
+  
+  .vote-summary { margin-top: 16px; display: grid; gap: 8px; }
+  .vote-row { display: flex; justify-content: space-between; padding: 10px 16px; background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; font-size: 0.95rem; color: var(--text-main); font-family: var(--font-mono); }
+  .vote-row .count { color: var(--neon-cyan); font-weight: 600; }
+  .vote-row.top { border-color: var(--neon-cyan); box-shadow: 0 0 10px rgba(0, 243, 255, 0.1); }
+  
+  .code-box { 
+    text-align: center; font-size: 2.5rem; font-weight: 800; letter-spacing: 8px; font-family: var(--font-mono);
+    color: #fff; background: rgba(0, 0, 0, 0.6); padding: 16px; border-radius: 12px;
+    border: 1px solid var(--neon-cyan); box-shadow: 0 0 20px rgba(0, 243, 255, 0.2), inset 0 0 15px rgba(0, 243, 255, 0.1);
+    margin: 16px 0; user-select: all; text-shadow: 0 0 10px var(--neon-cyan);
+  }
+  
+  .players-list { display: grid; gap: 8px; margin-top: 16px; }
+  .player-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: rgba(0, 0, 0, 0.4); border-radius: 8px; font-size: 0.95rem; font-family: var(--font-mono); border: 1px solid rgba(148,163,184,0.1); }
+  .player-row .tag { font-size: 0.8rem; color: var(--text-muted); }
+  .player-row.ready { border-color: var(--neon-green); background: rgba(0, 255, 102, 0.05); }
+  .player-row.ready .tag { color: var(--neon-green); }
+
+  .tabs { display: flex; gap: 12px; margin-top: 16px; }
   .tabs button { margin-top: 0; }
-  .small { font-size: 0.78rem; color: #94a3b8; text-align:center; margin-top: 8px; }
-  .qr-wrap { text-align: center; margin: 12px 0; }
-  .qr-wrap img { width: 180px; height: 180px; border-radius: 12px; background: white; padding: 8px; }
-  .imposter-pill {
-    display:inline-block; background: rgba(239,68,68,0.2); color:#fca5a5;
-    border: 1px solid rgba(239,68,68,0.5); border-radius:999px;
-    padding:4px 12px; font-size:0.8rem; margin: 2px;
-  }
-  .banner {
-    text-align:center; padding: 18px 14px; border-radius: 14px; margin-top: 8px;
-    font-size: 1.15rem; font-weight: 700; line-height: 1.4;
-  }
-  .banner.crew { background: rgba(34,197,94,0.15); border:1px solid rgba(34,197,94,0.5); color:#86efac; }
-  .banner.imposter { background: rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.5); color:#fca5a5; }
-  .banner.tie { background: rgba(253,224,71,0.12); border:1px solid rgba(253,224,71,0.45); color:#fde68a; }
+  .small { font-size: 0.8rem; color: var(--text-muted); text-align:center; margin-top: 12px; font-family: var(--font-mono); }
+  
+  .qr-wrap { text-align: center; margin: 16px 0; }
+  .qr-wrap img { width: 180px; height: 180px; border-radius: 12px; background: white; padding: 10px; box-shadow: 0 0 20px rgba(0, 243, 255, 0.3); }
+  
+  .imposter-pill { display:inline-block; background: rgba(255, 0, 60, 0.1); color:var(--neon-red); border: 1px solid var(--neon-red); border-radius: 4px; padding:4px 12px; font-size:0.85rem; margin: 4px; text-transform: uppercase; font-family: var(--font-mono); box-shadow: 0 0 8px rgba(255,0,60,0.2); }
+  
+  .banner { text-align:center; padding: 20px 16px; border-radius: 12px; margin-top: 12px; font-size: 1.4rem; font-weight: 700; text-transform: uppercase; letter-spacing: 2px; border: 1px solid; }
+  .banner.crew { border-color: var(--neon-green); background: rgba(0, 255, 102, 0.1); color: #fff; text-shadow: 0 0 10px var(--neon-green); box-shadow: 0 0 20px rgba(0, 255, 102, 0.2); }
+  .banner.imposter { border-color: var(--neon-red); background: rgba(255, 0, 60, 0.1); color: #fff; text-shadow: 0 0 10px var(--neon-red); box-shadow: 0 0 20px rgba(255, 0, 60, 0.2); }
+  .banner.tie { border-color: #fde68a; background: rgba(253, 224, 71, 0.1); color: #fff; text-shadow: 0 0 10px #fde68a; box-shadow: 0 0 20px rgba(253, 224, 71, 0.2); }
 
-  /* ---------- audio recorder ---------- */
-  .recorder {
-    display: flex; align-items: center; gap: 12px;
-    background: #1e293b; border: 1px solid #475569; border-radius: 12px;
-    padding: 12px; margin-top: 8px;
-  }
-  .rec-btn {
-    width: 60px; height: 60px; border-radius: 50%;
-    background: #dc2626; border: 2px solid #7f1d1d;
-    color: white; font-size: 1.5rem; padding: 0; margin: 0;
-    flex-shrink: 0; cursor: pointer;
-    transition: transform 0.1s;
-  }
+  .pass-banner { text-align: center; padding: 32px 20px; background: rgba(0, 243, 255, 0.05); border: 1px dashed var(--neon-cyan); border-radius: 12px; margin-bottom: 16px; }
+  .pass-banner .who { font-size: 1.6rem; font-weight: 700; color: #fff; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+  .pass-banner .msg { font-size: 0.95rem; color: var(--text-muted); line-height: 1.5; font-family: var(--font-mono); }
+
+  .recorder { display: flex; align-items: center; gap: 16px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255, 0, 60, 0.3); border-radius: 12px; padding: 16px; margin-top: 12px; }
+  .rec-btn { width: 64px; height: 64px; border-radius: 50%; background: rgba(255, 0, 60, 0.1); border: 2px solid var(--neon-red); color: var(--neon-red); font-size: 1.6rem; padding: 0; margin: 0; flex-shrink: 0; cursor: pointer; transition: all 0.2s; box-shadow: 0 0 10px rgba(255, 0, 60, 0.2); }
+  .rec-btn:hover { background: rgba(255, 0, 60, 0.2); box-shadow: 0 0 20px rgba(255, 0, 60, 0.4); }
   .rec-btn:active { transform: scale(0.92); }
-  .rec-btn.recording {
-    background: #991b1b;
-    animation: pulse 1s infinite;
-  }
-  @keyframes pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.7); }
-    50% { box-shadow: 0 0 0 12px rgba(220,38,38,0); }
-  }
-  .rec-info { flex: 1; font-size: 0.85rem; color: #cbd5e1; line-height: 1.4; }
-  .rec-timer { color: #fca5a5; font-weight: 700; font-size: 1rem; }
-  .rec-clear { padding: 6px 12px; font-size: 0.8rem; width: auto; margin: 0; background: #475569; }
+  .rec-btn.recording { background: var(--neon-red); color: #fff; animation: pulse-red 1s infinite; }
+  @keyframes pulse-red { 0%, 100% { box-shadow: 0 0 0 0 rgba(255, 0, 60, 0.7); } 50% { box-shadow: 0 0 0 15px rgba(255, 0, 60, 0); } }
+  .rec-info { flex: 1; font-size: 0.9rem; color: var(--text-main); line-height: 1.4; font-family: var(--font-mono); }
+  .rec-timer { color: var(--neon-red); font-weight: 700; font-size: 1.1rem; }
+  .rec-clear { padding: 8px 16px; font-size: 0.85rem; width: auto; margin: 0; background: transparent; border: 1px solid var(--text-muted); color: var(--text-muted); }
 
-  /* ---------- chat ---------- */
-  .chat-fab {
-    position: fixed; bottom: 18px; right: 18px;
-    width: 56px; height: 56px; border-radius: 50%;
-    background: linear-gradient(135deg, #6366f1, #8b5cf6);
-    box-shadow: 0 8px 24px rgba(99,102,241,0.5);
-    color: white; font-size: 1.4rem; padding: 0; margin: 0;
-    display: flex; align-items: center; justify-content: center;
-    cursor: pointer; z-index: 100;
-  }
-  .chat-fab .unread {
-    position: absolute; top: 4px; right: 4px;
-    background: #ef4444; color: white; font-size: 0.7rem;
-    min-width: 18px; height: 18px; border-radius: 9px;
-    display: flex; align-items: center; justify-content: center;
-    padding: 0 4px; font-weight: 700;
-  }
-  .chat-panel {
-    position: fixed; bottom: 0; left: 0; right: 0; top: 0;
-    background: rgba(2, 6, 23, 0.95); z-index: 200;
-    display: none; flex-direction: column;
-  }
+  .chat-fab { position: fixed; bottom: 24px; right: 24px; width: 60px; height: 60px; border-radius: 50%; background: var(--bg-card); border: 1px solid var(--neon-cyan); box-shadow: 0 0 20px rgba(0, 243, 255, 0.3); color: var(--neon-cyan); font-size: 1.5rem; padding: 0; margin: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; z-index: 100; transition: all 0.2s; }
+  .chat-fab:hover { transform: scale(1.1); box-shadow: 0 0 30px rgba(0, 243, 255, 0.5); }
+  .chat-fab .unread { position: absolute; top: 0; right: 0; background: var(--neon-red); color: #fff; font-size: 0.75rem; font-family: var(--font-mono); min-width: 20px; height: 20px; border-radius: 10px; display: flex; align-items: center; justify-content: center; padding: 0 4px; font-weight: 700; box-shadow: 0 0 10px var(--neon-red); }
+
+  .chat-panel { position: fixed; bottom: 0; left: 0; right: 0; top: 0; background: rgba(5, 5, 15, 0.95); backdrop-filter: blur(10px); z-index: 200; display: none; flex-direction: column; }
   .chat-panel.open { display: flex; }
-  .chat-header {
-    padding: 16px; border-bottom: 1px solid #334155;
-    display: flex; justify-content: space-between; align-items: center;
-    background: #0f172a;
-  }
-  .chat-header h3 { font-size: 1.1rem; }
-  .chat-close {
-    background: transparent; border: none; color: white;
-    font-size: 1.6rem; width: auto; padding: 0 8px; margin: 0;
-  }
-  .chat-messages {
-    flex: 1; overflow-y: auto; padding: 12px 16px;
-    display: flex; flex-direction: column; gap: 8px;
-  }
-  .chat-msg {
-    max-width: 80%; padding: 8px 12px; border-radius: 12px;
-    font-size: 0.9rem; line-height: 1.4; word-wrap: break-word;
-  }
-  .chat-msg.mine { align-self: flex-end; background: #4f46e5; border-bottom-right-radius: 4px; }
-  .chat-msg.other { align-self: flex-start; background: #334155; border-bottom-left-radius: 4px; }
-  .chat-msg.system { align-self: center; background: transparent; color: #94a3b8;
-                      font-size: 0.78rem; font-style: italic; text-align: center; padding: 4px; }
-  .chat-msg .sender { font-size: 0.72rem; opacity: 0.7; margin-bottom: 2px; font-weight: 600; }
-  .chat-input-row {
-    padding: 12px 16px 20px; border-top: 1px solid #334155;
-    display: flex; gap: 8px; background: #0f172a;
-  }
+  .chat-header { padding: 20px; border-bottom: 1px solid rgba(0, 243, 255, 0.3); display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.5); }
+  .chat-header h3 { font-size: 1.2rem; text-transform: uppercase; letter-spacing: 2px; color: var(--neon-cyan); }
+  .chat-close { background: transparent; border: none; color: var(--text-muted); font-size: 2rem; width: auto; padding: 0 8px; margin: 0; cursor: pointer; }
+  .chat-close:hover { color: #fff; }
+  .chat-messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+  .chat-msg { max-width: 85%; padding: 10px 16px; border-radius: 8px; font-size: 0.95rem; line-height: 1.4; font-family: var(--font-mono); word-wrap: break-word; }
+  .chat-msg.mine { align-self: flex-end; background: rgba(0, 243, 255, 0.1); border: 1px solid var(--neon-cyan); color: #fff; border-bottom-right-radius: 0; }
+  .chat-msg.other { align-self: flex-start; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); color: var(--text-main); border-bottom-left-radius: 0; }
+  .chat-msg.system { align-self: center; background: transparent; color: var(--neon-purple); font-size: 0.8rem; font-style: italic; text-align: center; padding: 8px; }
+  .chat-msg .sender { font-size: 0.75rem; opacity: 0.8; margin-bottom: 4px; font-weight: 700; text-transform: uppercase; color: var(--neon-purple); }
+  .chat-input-row { padding: 16px 20px 30px; border-top: 1px solid rgba(0, 243, 255, 0.3); display: flex; gap: 12px; background: rgba(0,0,0,0.5); }
   .chat-input-row input { flex: 1; margin: 0; }
-  .chat-input-row button { width: auto; padding: 12px 18px; margin: 0; }
-  .chat-locked {
-    padding: 10px; text-align: center; color: #fca5a5;
-    font-size: 0.85rem; background: rgba(239,68,68,0.1);
-    border-top: 1px solid rgba(239,68,68,0.3);
-  }
+  .chat-input-row button { width: auto; padding: 12px 24px; margin: 0; }
+  .chat-locked { padding: 16px; text-align: center; color: var(--neon-red); font-size: 0.9rem; font-family: var(--font-mono); background: rgba(255, 0, 60, 0.1); border-top: 1px solid rgba(255, 0, 60, 0.3); }
 
-  /* ---------- menu / reset ---------- */
-  .menu-fab {
-    position: fixed; bottom: 18px; left: 18px;
-    width: 48px; height: 48px; border-radius: 50%;
-    background: #334155; color: white; font-size: 1.4rem;
-    padding: 0; margin: 0; z-index: 100;
-    display: flex; align-items: center; justify-content: center;
-    box-shadow: 0 6px 18px rgba(0,0,0,0.4);
-  }
-  .menu-panel {
-    position: fixed; inset: 0; background: rgba(2,6,23,0.9); z-index: 300;
-    display: none; align-items: center; justify-content: center; padding: 20px;
-  }
+  .menu-fab { position: fixed; bottom: 24px; left: 24px; width: 50px; height: 50px; border-radius: 50%; background: var(--bg-card); border: 1px solid rgba(255, 255, 255, 0.2); color: #fff; font-size: 1.4rem; padding: 0; margin: 0; z-index: 100; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 0 15px rgba(0,0,0,0.5); transition: all 0.2s; }
+  .menu-fab:hover { background: rgba(255,255,255,0.1); border-color: #fff; }
+  
+  .menu-panel { position: fixed; inset: 0; background: rgba(5, 5, 15, 0.8); backdrop-filter: blur(5px); z-index: 300; display: none; align-items: center; justify-content: center; padding: 20px; }
   .menu-panel.open { display: flex; }
-  .menu-card {
-    background: #0f172a; border: 1px solid #334155; border-radius: 16px;
-    padding: 24px; max-width: 380px; width: 100%;
-  }
-  .menu-card h3 { margin-bottom: 14px; text-align: center; }
-  .menu-card button { margin-top: 10px; }
+  .menu-card { background: var(--bg-card); border: 1px solid var(--neon-cyan); border-radius: 16px; padding: 28px; max-width: 400px; width: 100%; box-shadow: 0 0 30px rgba(0, 243, 255, 0.2); }
+  .menu-card h3 { margin-bottom: 20px; text-align: center; font-size: 1.4rem; text-transform: uppercase; letter-spacing: 2px; color: #fff; text-shadow: 0 0 10px var(--neon-cyan); }
+  .menu-card button { margin-top: 12px; }
+  .menu-card .small { margin-bottom: 20px; font-size: 0.9rem; }
 
-  /* ---------- scoreboard ---------- */
-  .scoreboard { background: #1e293b; border-radius: 12px; padding: 10px 14px; margin-top: 12px; }
-  .scoreboard h4 { font-size: 0.85rem; color: #94a3b8; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
-  .score-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 0.9rem; }
-  .score-row .pts { color: #86efac; font-weight: 700; }
+  .scoreboard { background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(176, 38, 255, 0.3); border-radius: 12px; padding: 16px; margin-top: 16px; box-shadow: inset 0 0 15px rgba(176, 38, 255, 0.05); }
+  .scoreboard h4 { font-size: 0.9rem; color: var(--neon-purple); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 2px; text-align: center; }
+  .score-row { display: flex; justify-content: space-between; padding: 8px 0; font-size: 0.95rem; font-family: var(--font-mono); border-bottom: 1px solid rgba(255,255,255,0.05); }
+  .score-row:last-child { border-bottom: none; }
+  .score-row .pts { color: var(--neon-cyan); font-weight: 700; text-shadow: 0 0 5px var(--neon-cyan); }
+  
+  .badge { display:inline-block; background: rgba(0, 243, 255, 0.1); border: 1px solid var(--neon-cyan); color: var(--neon-cyan); padding: 4px 12px; border-radius: 4px; font-size:0.8rem; font-weight:600; text-transform: uppercase; font-family: var(--font-mono); letter-spacing: 1px; }
+  .badge.local { background: rgba(0, 255, 102, 0.1); border-color: var(--neon-green); color: var(--neon-green); }
+
+  /* ================= TUTORIAL MODAL & ANIMATED BACKGROUND ================= */
+  .tutorial-modal {
+    position: fixed; inset: 0; background: rgba(5, 5, 15, 0.95); backdrop-filter: blur(8px);
+    z-index: 500; display: none; align-items: center; justify-content: center; padding: 20px;
+    overflow: hidden; /* Hide anything going outside the modal */
+  }
+  .tutorial-modal.open { display: flex; }
+
+  /* ANIMATED BACKGROUND LAYER */
+  .tutorial-bg {
+    position: absolute; inset: 0; z-index: 1;
+    pointer-events: none; /* Let clicks pass through */
+    opacity: 0.15;
+  }
+
+  /* Moving Grid */
+  .bg-grid {
+    position: absolute; inset: -100%;
+    background-image: 
+      linear-gradient(var(--neon-cyan) 1px, transparent 1px),
+      linear-gradient(90deg, var(--neon-cyan) 1px, transparent 1px);
+    background-size: 40px 40px;
+    animation: moveGrid 20s linear infinite;
+  }
+  @keyframes moveGrid {
+    0% { transform: translate(0, 0); }
+    100% { transform: translate(40px, 40px); }
+  }
+
+  /* Sneaking Spy */
+  .bg-spy {
+    position: absolute; bottom: 10%; left: -100px;
+    font-size: 5rem; filter: drop-shadow(0 0 10px var(--neon-red));
+    animation: sneak 8s linear infinite;
+  }
+  @keyframes sneak {
+    0% { left: -100px; transform: scaleX(1); }
+    45% { left: 50%; transform: scaleX(1); }
+    50% { left: 50%; transform: scaleX(-1); } /* Turn around */
+    95% { left: -100px; transform: scaleX(-1); }
+    100% { left: -100px; transform: scaleX(1); }
+  }
+
+  /* Floating Question Marks */
+  .bg-q {
+    position: absolute; font-size: 3rem; font-family: var(--font-ui); font-weight: 800;
+    color: var(--neon-purple); text-shadow: 0 0 10px var(--neon-purple);
+    animation: floatUpFade 4s ease-in infinite;
+  }
+  .bg-q.q1 { left: 20%; bottom: -50px; animation-delay: 0s; }
+  .bg-q.q2 { left: 70%; bottom: -50px; animation-delay: 1.5s; font-size: 2rem; }
+  .bg-q.q3 { left: 45%; bottom: -50px; animation-delay: 2.5s; font-size: 4rem; }
+  
+  @keyframes floatUpFade {
+    0% { transform: translateY(0) scale(0.5); opacity: 0; }
+    20% { opacity: 1; transform: translateY(-100px) scale(1); }
+    80% { opacity: 1; transform: translateY(-300px) scale(1.2); }
+    100% { opacity: 0; transform: translateY(-400px) scale(1.5); }
+  }
+
+  /* Scanning Magnifying Glass */
+  .bg-mag {
+    position: absolute; top: 20%; left: 10%;
+    font-size: 4rem; opacity: 0.8;
+    animation: scan 6s ease-in-out infinite;
+  }
+  @keyframes scan {
+    0%, 100% { transform: translate(0, 0) rotate(-15deg); }
+    25% { transform: translate(200px, 50px) rotate(15deg); }
+    50% { transform: translate(400px, -20px) rotate(-15deg); }
+    75% { transform: translate(150px, 100px) rotate(15deg); }
+  }
+
+  /* Modal Content */
+  .tutorial-card {
+    position: relative; z-index: 10; /* Sit above the animation */
+    background: rgba(15, 23, 42, 0.85); /* Slightly transparent to see anim */
+    backdrop-filter: blur(12px); /* Blur the animation behind the text */
+    border: 1px solid var(--neon-cyan); border-radius: 16px;
+    padding: 24px; max-width: 500px; width: 100%; max-height: 85vh; overflow-y: auto;
+    box-shadow: 0 0 40px rgba(0, 243, 255, 0.2);
+  }
+  .tutorial-card h2 { color: var(--neon-cyan); text-shadow: 0 0 10px rgba(0,243,255,0.5); margin-bottom: 16px; }
+  .tutorial-step { margin-bottom: 20px; padding-left: 16px; border-left: 2px solid var(--neon-purple); }
+  .tutorial-step h4 { color: #fff; font-size: 1.1rem; margin-bottom: 4px; text-transform: uppercase; }
+  .tutorial-step p { color: var(--text-main); font-size: 0.9rem; line-height: 1.5; font-family: var(--font-mono); }
+  .tutorial-card button { border-color: var(--neon-cyan); color: var(--neon-cyan); background: rgba(0,243,255,0.1); }
+  .tutorial-card button:hover { background: rgba(0,243,255,0.2); box-shadow: 0 0 20px rgba(0,243,255,0.4); }
+
+  /* ================= LIVE REACTIONS ================= */
+  .reaction-bar {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    display: none; gap: 8px; background: rgba(15, 23, 42, 0.8); border: 1px solid var(--neon-cyan);
+    padding: 8px 12px; border-radius: 30px; box-shadow: 0 0 20px rgba(0, 243, 255, 0.2);
+    z-index: 150; backdrop-filter: blur(4px);
+  }
+  .reaction-bar.active { display: flex; }
+  .reaction-btn {
+    background: transparent; border: none; font-size: 1.5rem; padding: 4px; margin: 0;
+    cursor: pointer; transition: transform 0.1s; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+  }
+  .reaction-btn:hover { transform: scale(1.2); }
+  .reaction-btn:active { transform: scale(0.9); }
+
+  .floating-reaction {
+    position: fixed; bottom: 80px; font-size: 3rem; pointer-events: none; z-index: 9999;
+    animation: floatUp 2s ease-out forwards;
+  }
+  @keyframes floatUp {
+    0% { opacity: 1; transform: translateY(0) scale(0.5); }
+    20% { transform: translateY(-20px) scale(1.2); }
+    100% { opacity: 0; transform: translateY(-150px) scale(1); }
+  }
 </style>
 </head>
 <body>
 <div class="app">
-  <h1>🕵️ Imposter Word</h1>
-  <p class="subtitle">Everyone on their own phone. Same word — except the imposters.</p>
+  <div style="position: absolute; top: 16px; right: 16px; z-index: 10;">
+    <button onclick="toggleTutorial()" style="width: 36px; height: 36px; padding: 0; border-radius: 50%; border-color: var(--neon-purple); color: var(--neon-purple); background: transparent; font-size: 1.2rem; margin: 0;">?</button>
+  </div>
 
-  <!-- ===================== HOME ===================== -->
-  <div id="screen-home" class="screen active">
-    <label for="playerName">Your name</label>
-    <input type="text" id="playerName" maxlength="20" placeholder="e.g. Rahul" autocomplete="off">
+  <h1>Imposter Protocol <span id="modeBadge" class="badge" style="display:none;"></span></h1>
+  <p class="subtitle">Find the traitor. Trust no one.</p>
 
+  <div id="screen-mode" class="screen active">
+    <div class="mode-grid">
+      <div class="mode-card" onclick="pickMode('online')">
+        <div class="icon">🌐</div>
+        <div class="title">Network Link</div>
+        <div class="desc">Play online with multiple devices. Create a lobby or join a secure channel.</div>
+      </div>
+      <div class="mode-card" onclick="pickMode('local')">
+        <div class="icon">📱</div>
+        <div class="title">Local Terminal</div>
+        <div class="desc">Pass one device around. Secure role reveal and local voting.</div>
+      </div>
+    </div>
+    <div class="small" id="resumeHint" style="display:none; margin-top:24px;">
+      <button class="secondary" onclick="resumeSession()">Resume Active Link</button>
+    </div>
+  </div>
+
+  <div id="screen-home" class="screen">
+    <button class="secondary" onclick="backToMode()" style="width:auto;padding:8px 16px;font-size:0.9rem;margin:0 0 16px;">← Disconnect</button>
+    <label for="playerName">Agent Name</label>
+    <input type="text" id="playerName" maxlength="20" placeholder="ENTER ID..." autocomplete="off">
     <div class="tabs">
-      <button onclick="createGame()">Create game</button>
-      <button class="secondary" onclick="showJoin()">Join game</button>
+      <button onclick="createGame()">Host Game</button>
+      <button class="secondary" onclick="showJoin()">Join Game</button>
     </div>
-
-    <div id="joinBox" style="display:none;">
-      <label for="joinCode">Room code</label>
+    <div id="joinBox" style="display:none; margin-top:16px;">
+      <label for="joinCode">Lobby Code</label>
       <input type="text" id="joinCode" maxlength="6" placeholder="XK4P2Q"
-             style="text-transform:uppercase;letter-spacing:3px;text-align:center;font-size:1.3rem;"
+             style="text-transform:uppercase;letter-spacing:6px;text-align:center;font-size:1.5rem;"
              autocomplete="off">
-      <button onclick="joinGame()">Join</button>
+      <button onclick="joinGame()">Establish Connection</button>
     </div>
-
-    <label for="lang">Language / भाषा (host only)</label>
+    <label for="lang" style="margin-top:24px;">Language / भाषा</label>
     <select id="lang">
       <option value="en">English</option>
       <option value="hi">हिन्दी (Hindi)</option>
     </select>
-
     <div id="homeError" class="error"></div>
-    <div class="small" id="resumeHint" style="display:none;">
-      <button class="secondary" onclick="resumeSession()" style="margin-top:8px;">Resume last game</button>
-    </div>
   </div>
 
-  <!-- ===================== LOBBY ===================== -->
+  <div id="screen-local-setup" class="screen">
+    <button class="secondary" onclick="backToMode()" style="width:auto;padding:8px 16px;font-size:0.9rem;margin:0 0 16px;">← Disconnect</button>
+    <h2>Local Terminal</h2>
+    <p class="subtitle">Configure agents for this terminal.</p>
+    <label for="localLang">Language / भाषा</label>
+    <select id="localLang">
+      <option value="en">English</option>
+      <option value="hi">हिन्दी (Hindi)</option>
+    </select>
+    <label for="localNumPlayers">Number of Agents (3–10)</label>
+    <input type="text" id="localNumPlayers" value="4" inputmode="numeric" style="text-align:center;font-size:1.3rem;">
+    <div id="localNameInputs" style="margin-top:16px;"></div>
+    <div id="localImposterBox">
+      <label for="localNumImposters">Number of Imposters</label>
+      <select id="localNumImposters">
+        <option value="1">1 Imposter</option>
+        <option value="2">2 Imposters</option>
+        <option value="3">3 Imposters</option>
+      </select>
+      <div class="small" id="localImposterNote"></div>
+    </div>
+    <button onclick="startLocalGame()" style="margin-top:24px;">Initialize Protocol</button>
+    <div id="localError" class="error"></div>
+  </div>
+
   <div id="screen-lobby" class="screen">
-    <h2>Lobby</h2>
-    <p class="subtitle">Scan the QR or share the code</p>
+    <h2>Waiting Room</h2>
+    <p class="subtitle">Scan QR or share Lobby Code</p>
     <div class="code-box" id="lobbyCode">------</div>
     <div class="qr-wrap" id="qrWrap"></div>
     <div class="players-list" id="lobbyPlayers"></div>
     <div class="progress" id="lobbyProgress"></div>
-
-    <div id="hostImposterBox" style="display:none;">
-      <label for="numImposters">Number of imposters</label>
+    <div id="hostImposterBox" style="display:none; margin-top:16px;">
+      <label for="numImposters">Imposter Count</label>
       <select id="numImposters">
-        <option value="1">1 imposter</option>
-        <option value="2">2 imposters</option>
-        <option value="3">3 imposters</option>
+        <option value="1">1 Imposter</option>
+        <option value="2">2 Imposters</option>
+        <option value="3">3 Imposters</option>
       </select>
       <div class="small" id="imposterNote"></div>
     </div>
-
-    <button id="lobbyReadyBtn" onclick="toggleReady()">I'm ready</button>
-    <button id="lobbyStartBtn" onclick="startGame()" style="display:none;">Start game</button>
+    <button id="lobbyReadyBtn" onclick="toggleReady()" style="margin-top:24px;">Ready Up</button>
+    <button id="lobbyStartBtn" onclick="startGame()" style="display:none; margin-top:16px; border-color: var(--neon-green); color: var(--neon-green); background: rgba(0,255,102,0.1);">Start Protocol</button>
     <div class="error" id="lobbyError"></div>
-    <div class="small">Auto-updates every 1.5s.</div>
+    <div class="small">Syncing data...</div>
   </div>
 
-  <!-- ===================== REVEAL ===================== -->
+  <div id="screen-pass" class="screen">
+    <div class="pass-banner">
+      <div class="who">Pass Terminal to <span id="passWho">Agent 1</span></div>
+      <div class="msg">Ensure no other agents are observing the screen.</div>
+    </div>
+    <button class="big" onclick="revealRole()">I am <span id="passWhoInline">Agent 1</span> — Show Role</button>
+  </div>
+
   <div id="screen-reveal" class="screen">
     <div class="round-header" id="revealRound">ROLE REVEAL</div>
-    <h2>Your secret role</h2>
-    <p class="subtitle">Keep this hidden!</p>
+    <h2>Your Secret Role</h2>
+    <p class="subtitle">Memorize this. Do not share.</p>
     <div id="revealCard" class="role-card">
       <div class="role-label" id="revealLabel">—</div>
       <div class="role-word" id="revealWord">—</div>
       <div class="role-hint" id="revealHint"></div>
     </div>
-    <button onclick="hostAdvance()" id="revealNextBtn" style="display:none;">Everyone ready — go to clues →</button>
-    <div class="progress" id="revealProgress">Only the host can advance.</div>
+    <button onclick="hostAdvance()" id="revealNextBtn" style="display:none; border-color: var(--neon-green); color: var(--neon-green); background: rgba(0,255,102,0.1);">Proceed to Clues →</button>
+    <button class="secondary" onclick="localHideAndContinue()" id="revealLocalBtn" style="display:none;">Hide &amp; Continue</button>
+    <div class="progress" id="revealProgress">Waiting for host...</div>
   </div>
 
-  <!-- ===================== CLUE ===================== -->
   <div id="screen-clue" class="screen">
     <div class="round-header" id="clueRoundHeader">ROUND 1 — CLUES</div>
-    <h2>Give your clue</h2>
-    <p class="subtitle">Type a clue <em>or</em> record a voice note (max 10s).</p>
-
-    <label for="clueInput">Type your clue</label>
-    <input type="text" id="clueInput" maxlength="80" placeholder="Type your clue..." autocomplete="off">
-    <button id="clueSubmitBtn" onclick="submitClue()">Submit written clue</button>
-
-    <div style="text-align:center;color:#94a3b8;font-size:0.85rem;margin:14px 0 6px;">— OR —</div>
-
+    <h2>Transmit Clue</h2>
+    <p class="subtitle">Provide a clue. Do not say the word.</p>
+    <div style="text-align:center; margin-bottom:16px;"><span class="badge" id="cluePlayerName">—</span></div>
+    <label for="clueInput">Text Transmission</label>
+    <input type="text" id="clueInput" maxlength="80" placeholder="ENTER CLUE..." autocomplete="off">
+    <button id="clueSubmitBtn" onclick="submitClue()">Send Text</button>
+    <div style="text-align:center;color:var(--neon-cyan);font-size:0.9rem;margin:20px 0 10px; font-family: var(--font-mono);">— OR —</div>
     <div class="recorder" id="recorderBox">
       <button class="rec-btn" id="recBtn" onclick="toggleRecording()">🎙️</button>
-      <div class="rec-info" id="recInfo">
-        Tap the mic to record a voice clue.<br>
-        Max 10 seconds.
-      </div>
+      <div class="rec-info" id="recInfo">Tap to record voice transmission.<br>Max 10 seconds.</div>
       <button class="rec-clear" id="recClearBtn" onclick="clearRecording()" style="display:none;">Clear</button>
     </div>
-    <audio id="recPlayback" controls style="width:100%;margin-top:8px;display:none;"></audio>
-    <button id="voiceSubmitBtn" onclick="submitVoice()" style="display:none;">Submit voice clue</button>
-
+    <audio id="recPlayback" controls style="width:100%;margin-top:12px;display:none; border-radius:8px; border:1px solid var(--neon-cyan);"></audio>
+    <button id="voiceSubmitBtn" onclick="submitVoice()" style="display:none; border-color: var(--neon-cyan); color: var(--neon-cyan);">Send Audio</button>
     <div class="error" id="clueError"></div>
     <div class="players-list" id="clueWaitingList"></div>
     <div class="progress" id="clueProgress"></div>
   </div>
 
-  <!-- ===================== SUMMARY ===================== -->
   <div id="screen-summary" class="screen">
     <div class="round-header" id="summaryHeader">ROUND 1 COMPLETE</div>
-    <h2>All clues</h2>
-    <p class="subtitle">Read carefully. Tap ▶ to play voice clues.</p>
-    <div id="summaryList" style="display:grid;gap:8px;margin-top:12px;"></div>
-    <button onclick="hostAdvance()" id="summaryNextBtn" style="display:none;">Continue →</button>
-    <div class="progress">Waiting for the host...</div>
+    <h2>Data Log</h2>
+    <p class="subtitle">Analyze the clues. Tap ▶ to play audio.</p>
+    <div id="summaryList" style="display:grid;gap:10px;margin-top:16px;"></div>
+    <button onclick="hostAdvance()" id="summaryNextBtn" style="display:none; border-color: var(--neon-green); color: var(--neon-green); background: rgba(0,255,102,0.1);">Next Round →</button>
+    <div class="progress" id="summaryProgress">Waiting for host...</div>
   </div>
 
-  <!-- ===================== VOTE ===================== -->
   <div id="screen-vote" class="screen">
-    <h2>Vote!</h2>
-    <p class="subtitle">Who is an imposter? Your vote is secret.</p>
-    <label>Your vote</label>
+    <h2>Voting Phase</h2>
+    <p class="subtitle">Identify the imposter.</p>
+    <div style="text-align:center; margin-bottom:16px;"><span class="badge" id="voteVoterName">—</span></div>
+    <label>Select Target</label>
     <div id="voteList" class="vote-list"></div>
-    <button id="voteSubmitBtn" onclick="submitVote()" disabled>Lock in vote</button>
+    <button id="voteSubmitBtn" onclick="submitVote()" disabled style="border-color: var(--neon-red); color: var(--neon-red); background: rgba(255,0,60,0.1);">Lock Vote</button>
     <div class="error" id="voteError"></div>
     <div class="players-list" id="voteWaitingList"></div>
-    <div class="small">💬 Use chat below to discuss while waiting.</div>
+    <div class="small" id="voteChatHint">💬 Use comms link to discuss.</div>
   </div>
 
-  <!-- ===================== RESULT ===================== -->
   <div id="screen-result" class="screen">
     <div id="resultBanner" class="banner">—</div>
     <div class="result-detail" id="resultDetail"></div>
-
-    <div id="voteSummaryBox" style="margin-top:14px;">
+    <div id="voteSummaryBox" style="margin-top:20px;">
       <div class="round-header">VOTE TALLY</div>
       <div id="voteSummary" class="vote-summary"></div>
     </div>
-
-    <div id="imposterBox" style="margin-top:14px;text-align:center;"></div>
-
+    <div id="imposterBox" style="margin-top:20px;text-align:center;"></div>
     <div class="scoreboard" id="scoreboard"></div>
-
-    <div id="resultClues" style="margin-top:14px;"></div>
-
-    <button onclick="playAgain()" id="playAgainBtn" style="display:none;">▶ Play again (same players)</button>
-    <div class="progress" id="resultProgress">Waiting for host...</div>
+    <div id="resultClues" style="margin-top:20px;"></div>
+    <button onclick="playAgain()" id="playAgainBtn" style="display:none; border-color: var(--neon-cyan); color: var(--neon-cyan); background: rgba(0,243,255,0.1);">Restart Protocol</button>
+    <button class="secondary" onclick="backToMode()" style="margin-top:16px;">Disconnect</button>
+    <div class="progress" id="resultProgress"></div>
   </div>
 </div>
 
-<!-- ===================== CHAT FAB ===================== -->
+<!-- LIVE REACTION BAR -->
+<div class="reaction-bar" id="reactionBar">
+  <button class="reaction-btn" onclick="sendReaction('😂')">😂</button>
+  <button class="reaction-btn" onclick="sendReaction('😱')">😱</button>
+  <button class="reaction-btn" onclick="sendReaction('😡')">😡</button>
+  <button class="reaction-btn" onclick="sendReaction('🤬')">🤬</button>
+  <button class="reaction-btn" onclick="sendReaction('🕵️')">🕵️</button>
+</div>
+
+<!-- TUTORIAL MODAL WITH ANIMATED BACKGROUND -->
+<div class="tutorial-modal" id="tutorialModal">
+  
+  <!-- BACKGROUND ANIMATIONS -->
+  <div class="tutorial-bg">
+    <div class="bg-grid"></div>
+    <div class="bg-spy">🕵️</div>
+    <div class="bg-mag">🔍</div>
+    <div class="bg-q q1">?</div>
+    <div class="bg-q q2">?</div>
+    <div class="bg-q q3">?</div>
+  </div>
+
+  <!-- CONTENT -->
+  <div class="tutorial-card">
+    <h2>How to Play</h2>
+    <div class="tutorial-step">
+      <h4>1. The Roles</h4>
+      <p>Everyone receives a secret word except for the <strong>Imposter(s)</strong>. The Imposter gets a vague hint instead. The crew must describe the word without saying it. The Imposter must blend in.</p>
+    </div>
+    <div class="tutorial-step">
+      <h4>2. The Clues</h4>
+      <p>Players take turns providing a clue (either by typing or recording a voice note). The clue must relate to the secret word, but be vague enough that the Imposter doesn't guess the word.</p>
+    </div>
+    <div class="tutorial-step">
+      <h4>3. Discussion</h4>
+      <p>After two rounds of clues, use the Secure Comms (chat) to discuss. Who sounds suspicious? Who is being too vague?</p>
+    </div>
+    <div class="tutorial-step">
+      <h4>4. Voting</h4>
+      <p>Everyone votes for who they think the Imposter is. The player with the most votes is eliminated.</p>
+    </div>
+    <div class="tutorial-step">
+      <h4>5. Win Condition</h4>
+      <p><strong>Crew Wins</strong> if they vote out an Imposter. <strong>Imposters Win</strong> if they survive the vote or if a Crew member is voted out.</p>
+    </div>
+    <button onclick="toggleTutorial()">Understood</button>
+  </div>
+</div>
+
 <button class="chat-fab" id="chatFab" onclick="toggleChat()" style="display:none;">
   💬<span class="unread" id="chatUnread" style="display:none;">0</span>
 </button>
 
-<!-- ===================== CHAT PANEL ===================== -->
 <div class="chat-panel" id="chatPanel">
   <div class="chat-header">
-    <h3>💬 Room chat</h3>
+    <h3>Secure Comms</h3>
     <button class="chat-close" onclick="toggleChat()">×</button>
   </div>
   <div class="chat-messages" id="chatMessages"></div>
-  <div class="chat-locked" id="chatLocked" style="display:none;">Chat is locked during this phase.</div>
+  <div class="chat-locked" id="chatLocked" style="display:none;">Comms locked during this phase.</div>
   <div class="chat-input-row" id="chatInputRow">
-    <input type="text" id="chatInput" maxlength="200" placeholder="Say something..." autocomplete="off">
+    <input type="text" id="chatInput" maxlength="200" placeholder="Transmit message..." autocomplete="off">
     <button onclick="sendChat()">Send</button>
   </div>
 </div>
 
-<!-- ===================== MENU FAB ===================== -->
 <button class="menu-fab" id="menuFab" onclick="toggleMenu()" style="display:none;">☰</button>
 
-<!-- ===================== MENU PANEL ===================== -->
 <div class="menu-panel" id="menuPanel">
   <div class="menu-card">
-    <h3>Game menu</h3>
-    <div class="small" style="margin-bottom:12px;">
-      Room: <strong id="menuRoomCode">------</strong><br>
-      You: <strong id="menuYouName">—</strong>
+    <h3>System Menu</h3>
+    <div class="small" style="margin-bottom:20px;">
+      Lobby: <strong id="menuRoomCode">------</strong><br>
+      Agent: <strong id="menuYouName">—</strong>
     </div>
-    <button class="secondary" onclick="leaveGame()">🚪 Leave game</button>
-    <button class="danger" id="menuEndBtn" onclick="endGame()" style="display:none;">🛑 End game for everyone</button>
+    <button class="secondary" onclick="leaveGame()">🚪 Disconnect</button>
+    <button class="danger" id="menuEndBtn" onclick="endGame()" style="display:none;">🛑 Terminate Lobby</button>
     <button class="secondary" onclick="toggleMenu()">Cancel</button>
   </div>
 </div>
 
 <script>
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(console.error);
-  });
-}
-// ============================================================================
-//  STATE
-// ============================================================================
-const STORAGE_KEY = 'imposter_session_v4';
+const STORAGE_KEY = 'imposter_session_v9';
 let session = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
 let current = null;
 let pollTimer = null;
 let selectedVote = null;
 let chatOpen = false;
 let lastChatCount = 0;
+let activeReactionTimers = {};
+
 let mediaRecorder = null;
 let recordedChunks = [];
 let recordedAudioDataUrl = null;
 let recordTimer = null;
 let recordSeconds = 0;
+
+let local = null;
+let localResult = null;
+let localNames = ['', '', '', ''];
+let localWordCache = null;
 
 const $ = id => document.getElementById(id);
 const show = id => {
@@ -1195,7 +1346,11 @@ async function api(path, body) {
   if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
   return data;
 }
-
+async function apiGet(path) {
+  const res = await fetch('/api/' + path);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
 function saveSession(s) {
   session = s;
   if (s) localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
@@ -1203,7 +1358,68 @@ function saveSession(s) {
 }
 
 // ============================================================================
-//  HOME
+// MODE & TUTORIAL
+// ============================================================================
+function pickMode(mode) {
+  if (mode === 'online') {
+    $('modeBadge').style.display = 'none';
+    show('screen-home');
+  } else {
+    $('modeBadge').style.display = 'inline-block';
+    $('modeBadge').textContent = 'LOCAL';
+    $('modeBadge').className = 'badge local';
+    initLocalSetup();
+    show('screen-local-setup');
+  }
+}
+function backToMode() {
+  stopPolling();
+  $('chatFab').style.display = 'none';
+  $('menuFab').style.display = 'none';
+  $('reactionBar').classList.remove('active');
+  $('menuPanel').classList.remove('open');
+  $('chatPanel').classList.remove('open');
+  $('modeBadge').style.display = 'none';
+  $('resumeHint').style.display = session ? 'block' : 'none';
+  show('screen-mode');
+}
+function toggleTutorial() {
+  $('tutorialModal').classList.toggle('open');
+}
+
+// ============================================================================
+// LIVE REACTIONS
+// ============================================================================
+async function sendReaction(emoji) {
+  if (!session || local) return;
+  spawnFloatingEmoji(emoji);
+  try { await api('react', { ...session, emoji }); } catch(e) {}
+}
+
+function spawnFloatingEmoji(emoji) {
+  const el = document.createElement('div');
+  el.className = 'floating-reaction';
+  el.textContent = emoji;
+  el.style.left = (20 + Math.random() * 60) + '%';
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 2000);
+}
+
+function checkReactions(s) {
+  if (!s.reactions || s.reactions.length === 0) return;
+  const now = Date.now() / 1000;
+  s.reactions.forEach(r => {
+    const key = r.ts + '_' + r.name;
+    if (!activeReactionTimers[key] && (now - r.ts < 2.5)) {
+      activeReactionTimers[key] = true;
+      spawnFloatingEmoji(r.emoji);
+      setTimeout(() => { delete activeReactionTimers[key]; }, 2500);
+    }
+  });
+}
+
+// ============================================================================
+// ONLINE HOME
 // ============================================================================
 function showJoin() {
   $('joinBox').style.display = 'block';
@@ -1217,7 +1433,7 @@ function err(msg) { $('homeError').textContent = msg || ''; }
 async function createGame() {
   err('');
   const name = $('playerName').value.trim();
-  if (!name) return err('Enter your name first');
+  if (!name) return err('Enter Agent Name');
   const lang = $('lang').value;
   try {
     const r = await api('create', { name, lang });
@@ -1225,32 +1441,30 @@ async function createGame() {
     applyState(r.state);
   } catch (e) { err(e.message); }
 }
-
 async function joinGame() {
   err('');
   const name = $('playerName').value.trim();
   const code = $('joinCode').value.trim().toUpperCase();
-  if (!name) return err('Enter your name first');
-  if (code.length !== 6) return err('Room code must be 6 characters');
+  if (!name) return err('Enter Agent Name');
+  if (code.length !== 6) return err('Invalid Lobby Code (6 chars)');
   try {
     const r = await api('join', { name, code });
     saveSession({ code: r.code, token: r.token, name });
     applyState(r.state);
   } catch (e) {
-    const m = { game_not_found: 'No game with that code', game_in_progress: 'That game already started',
-                game_full: 'That game is full (10 max)', name_taken: 'That name is taken in this room' };
+    const m = { game_not_found: 'Lobby not found', game_in_progress: 'Lobby already started',
+                game_full: 'Lobby full (10 max)', name_taken: 'Name taken in this lobby' };
     err(m[e.message] || e.message);
   }
 }
-
 async function resumeSession() {
   if (!session) return;
   try { applyState(await api('state', session)); }
-  catch (e) { saveSession(null); err('That game no longer exists'); }
+  catch (e) { saveSession(null); $('resumeHint').style.display = 'none'; alert('Lobby expired.'); }
 }
 
 // ============================================================================
-//  POLLING
+// ONLINE POLLING
 // ============================================================================
 function startPolling() {
   stopPolling();
@@ -1259,29 +1473,31 @@ function startPolling() {
     try { applyState(await api('state', session)); }
     catch (e) {
       if (e.message === 'game_not_found' || e.message === 'not_in_game') {
-        saveSession(null); stopPolling(); show('screen-home');
+        saveSession(null); stopPolling(); backToMode();
       }
     }
   }, 1500);
 }
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 
-// ============================================================================
-//  ROUTER
-// ============================================================================
 function applyState(s) {
   current = s;
+  $('modeBadge').style.display = 'none';
   const p = s.phase;
   if (p === 'lobby')        renderLobby(s);
-  else if (p === 'reveal')  renderReveal(s);
+  else if (p === 'reveal')  renderRevealOnline(s);
   else if (p === 'clue')    renderClue(s);
   else if (p === 'summary') renderSummary(s);
-  else if (p === 'vote')    renderVote(s);
+  else if (p === 'vote')    renderVoteOnline(s);
   else if (p === 'result')  renderResult(s);
+  
   updateChatBadge(s);
+  checkReactions(s); 
+  
   if (chatOpen) renderChat(s);
-  // show menu FAB when in a game
   $('menuFab').style.display = 'flex';
+  $('reactionBar').classList.add('active');
+  
   $('menuRoomCode').textContent = s.code;
   $('menuYouName').textContent = s.you ? s.you.name : '—';
   $('menuEndBtn').style.display = s.is_host ? 'block' : 'none';
@@ -1289,13 +1505,13 @@ function applyState(s) {
 }
 
 // ============================================================================
-//  LOBBY
+// ONLINE LOBBY
 // ============================================================================
 function renderLobby(s) {
   show('screen-lobby');
   $('lobbyCode').textContent = s.code;
   const joinUrl = location.origin + '/join?code=' + s.code;
-  $('qrWrap').innerHTML = `<img alt="QR to join" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(joinUrl)}">`;
+  $('qrWrap').innerHTML = `<img alt="QR" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&color=0f172a&bgcolor=ffffff&data=${encodeURIComponent(joinUrl)}">`;
   const list = $('lobbyPlayers');
   list.innerHTML = '';
   s.players.forEach(p => {
@@ -1303,15 +1519,14 @@ function renderLobby(s) {
     d.className = 'player-row' + (p.ready ? ' ready' : '');
     const mine = p.name === s.you.name;
     const kick = s.is_host && !mine && s.phase === 'lobby'
-      ? ` <button class="rec-clear" style="padding:2px 8px;font-size:0.7rem;" onclick="kickPlayer('${esc(p.name)}')">✕</button>` : '';
-    d.innerHTML = `<span>${esc(p.name)}${mine ? ' (you)' : ''}${p.name === s.host_name ? ' 👑' : ''}</span>
-                   <span class="tag">${p.ready ? '✅ ready' : '⏳ not ready'}${kick}</span>`;
+      ? ` <button class="rec-clear" style="padding:4px 10px;font-size:0.75rem;border-color:var(--neon-red);color:var(--neon-red);" onclick="kickPlayer('${esc(p.name)}')">✕</button>` : '';
+    d.innerHTML = `<span>${esc(p.name)}${mine ? ' (YOU)' : ''}${p.name === s.host_name ? ' 👑' : ''}</span>
+                   <span class="tag">${p.ready ? '✅ READY' : '⏳ WAIT'}${kick}</span>`;
     list.appendChild(d);
   });
-  $('lobbyProgress').textContent = `${s.players.length} player(s) — need 3+, up to 10`;
-  $('lobbyReadyBtn').textContent = s.you.ready ? 'Not ready' : "I'm ready";
+  $('lobbyProgress').textContent = `AGENTS: ${s.players.length} / 10 — MIN 3`;
+  $('lobbyReadyBtn').textContent = s.you.ready ? 'Stand Down' : "Ready Up";
   $('lobbyReadyBtn').className = s.you.ready ? 'secondary' : '';
-
   const n = s.players.length;
   const maxK = Math.max(1, Math.floor((n - 1) / 2));
   const box = $('hostImposterBox');
@@ -1321,34 +1536,27 @@ function renderLobby(s) {
     sel.innerHTML = '';
     for (let k = 1; k <= Math.min(3, maxK); k++) {
       const opt = document.createElement('option');
-      opt.value = k; opt.textContent = k + ' imposter' + (k > 1 ? 's' : '');
+      opt.value = k; opt.textContent = k + ' Imposter' + (k > 1 ? 's' : '');
       sel.appendChild(opt);
     }
     sel.value = String(Math.min(s.imposter_count, Math.min(3, maxK)));
-    $('imposterNote').textContent = `Max ${maxK} with ${n} players.`;
-  } else {
-    box.style.display = 'none';
-  }
-
+    $('imposterNote').textContent = `Max ${maxK} with ${n} agents.`;
+  } else box.style.display = 'none';
   if (s.is_host) {
     $('lobbyStartBtn').style.display = 'block';
     const allReady = s.players.every(p => p.ready);
     $('lobbyStartBtn').disabled = !(n >= 3 && allReady);
     $('lobbyStartBtn').textContent = n < 3
-      ? `Need ${3 - n} more player(s)`
-      : (allReady ? '▶ Start game' : 'Waiting for everyone to be ready');
-  } else {
-    $('lobbyStartBtn').style.display = 'none';
-  }
+      ? `Need ${3 - n} more agents`
+      : (allReady ? '▶ START PROTOCOL' : 'Waiting for ready status');
+  } else $('lobbyStartBtn').style.display = 'none';
   $('chatFab').style.display = 'flex';
 }
-
 async function toggleReady() {
   if (!session) return;
   try { applyState(await api('ready', { ...session, ready: !current.you.ready })); }
   catch (e) { $('lobbyError').textContent = e.message; }
 }
-
 async function startGame() {
   if (!session) return;
   $('lobbyError').textContent = '';
@@ -1356,77 +1564,680 @@ async function startGame() {
   try { applyState(await api('start', { ...session, num_imposters: k })); }
   catch (e) { $('lobbyError').textContent = e.message; }
 }
-
 async function kickPlayer(name) {
   if (!session) return;
-  if (!confirm(`Remove ${name} from the room?`)) return;
+  if (!confirm(`Remove ${name}?`)) return;
   try { applyState(await api('kick', { ...session, target: name })); }
   catch (e) { alert(e.message); }
 }
 
 // ============================================================================
-//  REVEAL
+// ONLINE SCREENS
 // ============================================================================
-function renderReveal(s) {
+function renderRevealOnline(s) {
   show('screen-reveal');
   const card = $('revealCard');
   const isImp = !!s.you_are_imposter;
   card.className = 'role-card ' + (isImp ? 'imposter' : 'crew');
-  $('revealLabel').textContent = isImp ? 'You are an IMPOSTER!' : 'Your word';
+  $('revealLabel').textContent = isImp ? 'YOU ARE THE IMPOSTER' : 'YOUR SECRET WORD';
   $('revealWord').textContent = isImp ? '🤫' : (s.your_word || '—');
   $('revealHint').textContent = isImp
-    ? 'Hint: ' + (s.your_hint || '') + '\nBlend in — don\'t get caught!'
-    : 'Describe it without saying the word!';
-  $('revealRound').textContent = `ROLE REVEAL — ${s.imposter_count} IMPOSTER${s.imposter_count>1?'S':''} HIDDEN`;
+    ? 'HINT: ' + (s.your_hint || '') + '\nBLEND IN. DO NOT GET CAUGHT.'
+    : 'DESCRIBE IT WITHOUT SAYING THE WORD.';
+  $('revealRound').textContent = `ROLE REVEAL — ${s.imposter_count} IMPOSTER${s.imposter_count>1?'S':''} DETECTED`;
   $('revealNextBtn').style.display = s.is_host ? 'block' : 'none';
+  $('revealLocalBtn').style.display = 'none';
   $('chatFab').style.display = 'flex';
 }
-
-// ============================================================================
-//  CLUE + RECORDING
-// ============================================================================
-let clueAudioEl = null;
 
 function renderClue(s) {
   show('screen-clue');
   $('clueRoundHeader').textContent = `ROUND ${s.round} OF 2 — CLUES`;
+  $('cluePlayerName').textContent = s.you ? s.you.name : '—';
+  $('cluePlayerName').className = 'badge';
+  
   const submitted = s.you.clue || s.you.clue_audio;
+  
+  if (!submitted) {
+    if ($('clueInput').disabled) {
+       $('clueInput').value = '';
+    }
+  }
+  
   $('clueInput').disabled = !!submitted;
   $('clueSubmitBtn').disabled = !!submitted;
-  $('clueSubmitBtn').textContent = submitted ? 'Submitted ✅' : 'Submit written clue';
+  $('clueSubmitBtn').textContent = submitted ? 'Transmitted ✅' : 'Send Text';
   if (submitted && s.you.clue) $('clueInput').value = s.you.clue;
+  
   $('voiceSubmitBtn').style.display = recordedAudioDataUrl && !submitted ? 'block' : 'none';
   $('voiceSubmitBtn').disabled = !!submitted;
-
   const wl = $('clueWaitingList');
   wl.innerHTML = '';
   s.players.forEach(p => {
     const d = document.createElement('div');
     d.className = 'player-row';
-    d.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${p.has_clue ? '✅ done' : '✏️ thinking...'}</span>`;
+    d.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${p.has_clue ? '✅ SENT' : '✏️ INPUTTING...'}</span>`;
     wl.appendChild(d);
   });
   const done = s.players.filter(p => p.has_clue).length;
-  $('clueProgress').textContent = `${done} / ${s.players.length} submitted`;
-  $('chatFab').style.display = submitted ? 'flex' : 'none';  // chat unlocked after submit
+  $('clueProgress').textContent = `STATUS: ${done} / ${s.players.length} TRANSMITTED`;
+  $('chatFab').style.display = submitted ? 'flex' : 'none';
   if (chatOpen && submitted) renderChat(s);
 }
 
+function renderSummary(s) {
+  show('screen-summary');
+  $('summaryHeader').textContent = `ROUND ${s.round} COMPLETE`;
+  const list = $('summaryList');
+  list.innerHTML = '';
+  s.players.forEach(p => {
+    const d = document.createElement('div');
+    d.className = 'clue-item' + (p.name === s.you.name ? ' mine' : '');
+    if (p.clue) d.innerHTML = `<span class="name">${esc(p.name)}:</span> ${esc(p.clue)}`;
+    else if (p.clue_audio) d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ VOICE
+      <button class="play-btn" onclick="playAudio('${p.clue_audio}')">▶ Play</button>`;
+    else d.innerHTML = `<span class="name">${esc(p.name)}:</span> —`;
+    list.appendChild(d);
+  });
+  const btn = $('summaryNextBtn');
+  if (s.is_host) {
+    btn.style.display = 'block';
+    btn.textContent = s.round === 1 ? 'Start Round 2 →' : 'Proceed to Voting →';
+  } else btn.style.display = 'none';
+  $('chatFab').style.display = 'flex';
+}
+
+function renderVoteOnline(s) {
+  show('screen-vote');
+  $('voteVoterName').textContent = s.you ? s.you.name : '—';
+  const voted = s.you.has_voted;
+  if (voted) selectedVote = null;
+  $('voteSubmitBtn').disabled = !selectedVote || voted;
+  $('voteSubmitBtn').textContent = voted ? 'VOTE LOCKED ✅' : 'LOCK VOTE';
+  const list = $('voteList');
+  list.innerHTML = '';
+  s.players.forEach(p => {
+    const btn = document.createElement('button');
+    btn.className = 'vote-btn' + (p.name === selectedVote ? ' selected' : '') + (voted ? ' done' : '');
+    btn.textContent = p.name + (p.name === s.you.name ? ' (YOU)' : '');
+    if (p.name === s.you.name) btn.disabled = true;
+    else if (!voted) {
+      btn.onclick = () => {
+        selectedVote = p.name;
+        document.querySelectorAll('.vote-btn').forEach(b => b.classList.remove('selected'));
+        btn.classList.add('selected');
+        $('voteSubmitBtn').disabled = false;
+      };
+    }
+    list.appendChild(btn);
+  });
+  const wl = $('voteWaitingList');
+  wl.innerHTML = '';
+  s.players.forEach(p => {
+    const d = document.createElement('div');
+    d.className = 'player-row';
+    d.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${p.has_voted ? '✅ VOTED' : '⏳ WAITING'}</span>`;
+    wl.appendChild(d);
+  });
+  $('voteChatHint').style.display = 'block';
+  $('chatFab').style.display = 'flex';
+}
+
+function renderResult(s) {
+  show('screen-result');
+  const imposterNames = s.imposter_names || [];
+  const banner = $('resultBanner');
+  let title = '', cls = '';
+  if (s.result_banner === 'crew') { title = '🎉 CREW WINS!'; cls = 'crew'; }
+  else if (s.result_banner === 'imposter') { title = '😈 IMPOSTERS WIN!'; cls = 'imposter'; }
+  else { title = '🤝 TIE'; cls = 'tie'; }
+  banner.textContent = title;
+  banner.className = 'banner ' + cls;
+  let detail = '';
+  if (s.vote_tie) detail += `VOTE TIED.<br>`;
+  else if (s.voted_out_name) detail += `VOTED OUT: <strong>${esc(s.voted_out_name)}</strong><br>`;
+  detail += `IMPOSTER${imposterNames.length>1?'S':''}: ` +
+            imposterNames.map(n => `<strong>${esc(n)}</strong>`).join(', ') +
+            `<br>WORD: <strong>${esc(s.secret_word)}</strong>`;
+  $('resultDetail').innerHTML = detail;
+  const tally = s.vote_counts || {};
+  const entries = Object.entries(tally).sort((a, b) => b[1] - a[1]);
+  const topCount = entries.length ? entries[0][1] : 0;
+  const box = $('voteSummary');
+  box.innerHTML = '';
+  entries.forEach(([name, count]) => {
+    const row = document.createElement('div');
+    row.className = 'vote-row' + (count === topCount && count > 0 && !s.vote_tie ? ' top' : '');
+    row.innerHTML = `<span>${esc(name)}${imposterNames.includes(name) ? ' 🤫' : ''}</span>
+                     <span class="count">${count} VOTE${count === 1 ? '' : 'S'}</span>`;
+    box.appendChild(row);
+  });
+  $('imposterBox').innerHTML =
+    `<div class="round-header">IMPOSTER${imposterNames.length>1?'S':''}</div>` +
+    imposterNames.map(n => `<span class="imposter-pill">🕵️ ${esc(n)}</span>`).join(' ');
+  const scores = s.scores || {};
+  const sortedScores = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  const sb = $('scoreboard');
+  if (sortedScores.length) {
+    sb.innerHTML = '<h4>SESSION SCORES</h4>' +
+      sortedScores.map(([n, v]) => `<div class="score-row"><span>${esc(n)}</span><span class="pts">${v} WIN${v===1?'':'S'}</span></div>`).join('');
+  } else sb.innerHTML = '';
+  const rc = $('resultClues');
+  rc.innerHTML = '<div class="round-header">ROUND 2 DATA</div>';
+  s.players.forEach(p => {
+    const d = document.createElement('div');
+    d.className = 'clue-item' + (p.name === s.you.name ? ' mine' : '');
+    if (p.clue) d.innerHTML = `<span class="name">${esc(p.name)}:</span> ${esc(p.clue)}`;
+    else if (p.clue_audio) d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ VOICE
+      <button class="play-btn" onclick="playAudio('${p.clue_audio}')">▶ Play</button>`;
+    else d.innerHTML = `<span class="name">${esc(p.name)}:</span> —`;
+    rc.appendChild(d);
+  });
+  $('playAgainBtn').style.display = s.is_host ? 'block' : 'none';
+  $('resultProgress').textContent = s.is_host ? '' : 'WAITING FOR HOST...';
+  $('chatFab').style.display = 'flex';
+}
+
+async function playAgain() {
+  if (local) {
+    const scores = local.players.map(p => p.score || 0);
+    const names = local.players.map(p => p.name);
+    localNames = names;
+    startLocalGameWithScores(scores);
+    return;
+  }
+  if (!session) return;
+  try { applyState(await api('reset', session)); }
+  catch (e) { alert(e.message); }
+}
+
+async function hostAdvance() {
+  if (local) return localAdvance();
+  if (!session) return;
+  try { applyState(await api('advance', session)); }
+  catch (e) { alert(e.message); }
+}
+
+async function submitClue() {
+  if (local) return localSubmitClue('text');
+  if (!session) return;
+  $('clueError').textContent = '';
+  const text = $('clueInput').value.trim();
+  if (!text) { $('clueError').textContent = 'ENTER A CLUE.'; return; }
+  try { applyState(await api('clue', { ...session, text })); }
+  catch (e) {
+    const m = { contains_word: '❌ CLUE CONTAINS SECRET WORD!' };
+    $('clueError').textContent = m[e.message] || e.message;
+  }
+}
+async function submitVoice() {
+  if (local) return localSubmitClue('voice');
+  if (!session || !recordedAudioDataUrl) return;
+  $('clueError').textContent = '';
+  try {
+    applyState(await api('audio', { ...session, audio: recordedAudioDataUrl }));
+    clearRecording();
+  } catch (e) {
+    const m = { audio_too_large: 'AUDIO TOO LARGE.' };
+    $('clueError').textContent = m[e.message] || e.message;
+  }
+}
+async function submitVote() {
+  if (local) return localSubmitVote();
+  if (!session || !selectedVote) return;
+  $('voteError').textContent = '';
+  try {
+    const r = await api('vote', { ...session, target: selectedVote });
+    selectedVote = null;
+    applyState(r);
+  } catch (e) { $('voteError').textContent = e.message; }
+}
+
+function playAudio(dataUrl) {
+  const a = new Audio(dataUrl);
+  a.play().catch(() => alert('Tap again to play'));
+}
+
+// ============================================================================
+// LOCAL SETUP
+// ============================================================================
+function initLocalSetup() {
+  $('localError').textContent = '';
+  $('localNumPlayers').value = '4';
+  $('localLang').value = 'en';
+  $('localNumImposters').value = '1';
+  localNames = ['', '', '', ''];
+  renderLocalNameInputs();
+}
+
+function renderLocalNameInputs() {
+  const n = Math.max(3, Math.min(10, parseInt($('localNumPlayers').value, 10) || 4));
+  while (localNames.length < n) localNames.push('');
+  localNames = localNames.slice(0, n);
+  const box = $('localNameInputs');
+  box.innerHTML = '';
+  for (let i = 0; i < n; i++) {
+    const label = document.createElement('label');
+    label.textContent = `Agent ${i + 1}`;
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.maxLength = 20;
+    inp.value = localNames[i] || `Agent ${i + 1}`;
+    inp.placeholder = `ENTER NAME...`;
+    inp.oninput = () => { localNames[i] = inp.value; };
+    localNames[i] = inp.value;
+    box.appendChild(label);
+    box.appendChild(inp);
+  }
+  const maxK = Math.max(1, Math.floor((n - 1) / 2));
+  const sel = $('localNumImposters');
+  sel.innerHTML = '';
+  for (let k = 1; k <= Math.min(3, maxK); k++) {
+    const opt = document.createElement('option');
+    opt.value = k; opt.textContent = k + ' Imposter' + (k > 1 ? 's' : '');
+    sel.appendChild(opt);
+  }
+  sel.value = String(Math.min(parseInt(sel.value, 10) || 1, Math.min(3, maxK)));
+  $('localImposterNote').textContent = `Max ${maxK} with ${n} agents.`;
+}
+
+$('localNumPlayers').addEventListener('input', renderLocalNameInputs);
+
+async function ensureWordCache() {
+  if (localWordCache) return localWordCache;
+  try {
+    const r = await apiGet('words');
+    localWordCache = r.words;
+  } catch (e) {
+    localWordCache = [
+      {"en": {"word": "Pizza", "imposter_hint": "Round food cut into slices."},
+       "hi": {"word": "पिज़्ज़ा", "imposter_hint": "गोल खाना।"}},
+      {"en": {"word": "Car", "imposter_hint": "Four wheels."},
+       "hi": {"word": "कार", "imposter_hint": "चार पहिये।"}},
+      {"en": {"word": "Dog", "imposter_hint": "A loyal pet."},
+       "hi": {"word": "कुत्ता", "imposter_hint": "वफादार पालतू।"}},
+    ];
+  }
+  return localWordCache;
+}
+
+async function startLocalGame() {
+  $('localError').textContent = '';
+  const n = Math.max(3, Math.min(10, parseInt($('localNumPlayers').value, 10) || 4));
+  const names = localNames.slice(0, n).map((s, i) => (s || '').trim() || `Agent ${i + 1}`);
+  const lower = names.map(s => s.toLowerCase());
+  if (new Set(lower).size !== lower.length) {
+    $('localError').textContent = 'Agent names must be unique.';
+    return;
+  }
+  const lang = $('localLang').value;
+  const k = parseInt($('localNumImposters').value, 10) || 1;
+  const maxK = Math.max(1, Math.floor((n - 1) / 2));
+  const numImposters = Math.max(1, Math.min(k, maxK));
+
+  let bank;
+  try { bank = await ensureWordCache(); }
+  catch (e) { $('localError').textContent = 'Data link failed.'; return; }
+
+  const entry = bank[Math.floor(Math.random() * bank.length)][lang];
+  const imposterIndices = new Set();
+  while (imposterIndices.size < numImposters) {
+    imposterIndices.add(Math.floor(Math.random() * n));
+  }
+
+  local = {
+    lang,
+    word: entry.word,
+    imposterHint: entry.imposter_hint,
+    imposterIndices: [...imposterIndices].sort((a,b)=>a-b),
+    numImposters,
+    players: names.map((name, i) => ({
+      name,
+      isImposter: imposterIndices.has(i),
+      clue: '', clueAudio: null, vote: null, score: 0,
+    })),
+    round: 1,
+    phase: 'pass',
+    passIndex: 0,
+    clueIndex: 0,
+    voteIndex: 0,
+    selectedVote: null,
+  };
+  localResult = null;
+  localRenderPass();
+}
+
+// ============================================================================
+// LOCAL PASS + REVEAL
+// ============================================================================
+function localRenderPass() {
+  if (!local) return;
+  const p = local.players[local.passIndex];
+  $('passWho').textContent = p.name;
+  $('passWhoInline').textContent = p.name;
+  show('screen-pass');
+}
+
+function revealRole() {
+  if (!local) return;
+  const p = local.players[local.passIndex];
+  const isImp = p.isImposter;
+  const card = $('revealCard');
+  card.className = 'role-card ' + (isImp ? 'imposter' : 'crew');
+  $('revealLabel').textContent = isImp ? 'YOU ARE THE IMPOSTER' : 'YOUR SECRET WORD';
+  $('revealWord').textContent = isImp ? '🤫' : (local.word || '—');
+  $('revealHint').textContent = isImp
+    ? 'HINT: ' + (local.imposterHint || '') + '\nBLEND IN. DO NOT GET CAUGHT.'
+    : 'DESCRIBE IT WITHOUT SAYING THE WORD.';
+  $('revealRound').textContent = `ROLE REVEAL — ${local.numImposters} IMPOSTER${local.numImposters>1?'S':''} DETECTED`;
+  $('revealNextBtn').style.display = 'none';
+  $('revealLocalBtn').style.display = 'block';
+  $('revealProgress').textContent = `AGENT ${local.passIndex + 1} / ${local.players.length}`;
+  show('screen-reveal');
+}
+
+function localHideAndContinue() {
+  if (!local) return;
+  local.passIndex++;
+  if (local.passIndex < local.players.length) {
+    localRenderPass();
+  } else {
+    local.phase = 'clue';
+    local.round = 1;
+    local.clueIndex = 0;
+    localRenderClue();
+  }
+}
+
+// ============================================================================
+// LOCAL CLUES
+// ============================================================================
+function localRenderClue() {
+  if (!local) return;
+  clearRecording();
+  $('clueRoundHeader').textContent = `ROUND ${local.round} OF 2 — CLUES`;
+  const p = local.players[local.clueIndex];
+  if (!p) return;
+  $('cluePlayerName').textContent = p.name;
+  $('cluePlayerName').className = 'badge local';
+  
+  $('clueInput').value = '';
+  
+  $('clueInput').disabled = false;
+  $('clueSubmitBtn').disabled = false;
+  $('clueSubmitBtn').textContent = 'Send Text';
+  $('voiceSubmitBtn').style.display = 'none';
+  $('clueError').textContent = '';
+
+  const wl = $('clueWaitingList');
+  wl.innerHTML = '';
+  local.players.forEach((pl, i) => {
+    const d = document.createElement('div');
+    d.className = 'player-row';
+    let status = '⏳ WAITING';
+    if (pl.clue || pl.clueAudio) status = '✅ SENT';
+    else if (i === local.clueIndex) status = '✏️ YOUR TURN';
+    d.innerHTML = `<span>${esc(pl.name)}</span><span class="tag">${status}</span>`;
+    wl.appendChild(d);
+  });
+  const done = local.players.filter(pl => pl.clue || pl.clueAudio).length;
+  $('clueProgress').textContent = `STATUS: ${done} / ${local.players.length} TRANSMITTED`;
+  $('chatFab').style.display = 'none';
+  show('screen-clue');
+  setTimeout(() => $('clueInput').focus(), 100);
+}
+
+function localSubmitClue(kind) {
+  if (!local) return;
+  const p = local.players[local.clueIndex];
+  if (!p) return;
+  if (p.clue || p.clueAudio) return;
+
+  $('clueError').textContent = '';
+
+  if (kind === 'text') {
+    const text = ($('clueInput').value || '').trim();
+    if (!text) { $('clueError').textContent = 'ENTER A CLUE.'; return; }
+    const w = (local.word || '').toLowerCase();
+    if (w && text.toLowerCase().includes(w)) {
+      $('clueError').textContent = '❌ CLUE CONTAINS SECRET WORD!';
+      return;
+    }
+    p.clue = text;
+    p.clueAudio = null;
+  } else {
+    if (!recordedAudioDataUrl) {
+      $('clueError').textContent = 'NO AUDIO DETECTED.';
+      return;
+    }
+    p.clue = '';
+    p.clueAudio = recordedAudioDataUrl;
+    clearRecording();
+  }
+
+  local.clueIndex++;
+  if (local.clueIndex < local.players.length) {
+    localRenderClue();
+  } else {
+    local.phase = 'summary';
+    localRenderSummary();
+  }
+}
+
+// ============================================================================
+// LOCAL SUMMARY
+// ============================================================================
+function localRenderSummary() {
+  if (!local) return;
+  $('summaryHeader').textContent = `ROUND ${local.round} COMPLETE`;
+  const list = $('summaryList');
+  list.innerHTML = '';
+  local.players.forEach(p => {
+    const d = document.createElement('div');
+    d.className = 'clue-item';
+    if (p.clue) d.innerHTML = `<span class="name">${esc(p.name)}:</span> ${esc(p.clue)}`;
+    else if (p.clueAudio) d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ VOICE
+      <button class="play-btn" onclick="playAudio('${p.clueAudio}')">▶ Play</button>`;
+    else d.innerHTML = `<span class="name">${esc(p.name)}:</span> —`;
+    list.appendChild(d);
+  });
+  $('summaryNextBtn').style.display = 'block';
+  $('summaryNextBtn').textContent = local.round === 1 ? 'Start Round 2 →' : 'Proceed to Voting →';
+  show('screen-summary');
+  $('chatFab').style.display = 'none';
+}
+
+function localAdvance() {
+  if (!local) return;
+  if (local.phase === 'summary') {
+    if (local.round === 1) {
+      local.round = 2;
+      local.clueIndex = 0;
+      local.players.forEach(p => { p.clue = ''; p.clueAudio = null; });
+      local.phase = 'clue';
+      localRenderClue();
+    } else {
+      local.phase = 'vote';
+      local.voteIndex = 0;
+      local.players.forEach(p => { p.vote = null; });
+      localRenderVote();
+    }
+  }
+}
+
+// ============================================================================
+// LOCAL VOTE
+// ============================================================================
+function localRenderVote() {
+  if (!local) return;
+  const voter = local.players[local.voteIndex];
+  if (!voter) return;
+  $('voteVoterName').textContent = voter.name;
+  $('voteVoterName').className = 'badge local';
+  local.selectedVote = null;
+  $('voteSubmitBtn').disabled = true;
+  $('voteSubmitBtn').textContent = 'LOCK VOTE';
+  $('voteError').textContent = '';
+  const list = $('voteList');
+  list.innerHTML = '';
+  local.players.forEach((p, i) => {
+    if (i === local.voteIndex) return;
+    const btn = document.createElement('button');
+    btn.className = 'vote-btn';
+    btn.textContent = p.name;
+    btn.onclick = () => {
+      local.selectedVote = p.name;
+      document.querySelectorAll('.vote-btn').forEach(b => b.classList.remove('selected'));
+      btn.classList.add('selected');
+      $('voteSubmitBtn').disabled = false;
+    };
+    list.appendChild(btn);
+  });
+  const wl = $('voteWaitingList');
+  wl.innerHTML = '';
+  local.players.forEach((p, i) => {
+    const d = document.createElement('div');
+    d.className = 'player-row';
+    let status = '⏳ WAITING';
+    if (p.vote) status = '✅ VOTED';
+    else if (i === local.voteIndex) status = '✏️ YOUR TURN';
+    d.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${status}</span>`;
+    wl.appendChild(d);
+  });
+  $('voteChatHint').style.display = 'none';
+  $('chatFab').style.display = 'none';
+  show('screen-vote');
+}
+
+function localSubmitVote() {
+  if (!local || !local.selectedVote) return;
+  local.players[local.voteIndex].vote = local.selectedVote;
+  local.voteIndex++;
+  if (local.voteIndex < local.players.length) {
+    localRenderVote();
+  } else {
+    localResolveVotes();
+  }
+}
+
+function localResolveVotes() {
+  const counts = {};
+  local.players.forEach(p => counts[p.name] = 0);
+  local.players.forEach(p => { if (p.vote in counts) counts[p.vote]++; });
+  const top = Math.max(...Object.values(counts));
+  const leaders = Object.entries(counts).filter(([, c]) => c === top && c > 0).map(([n]) => n);
+  const tie = leaders.length > 1;
+  const votedOut = tie ? null : leaders[0];
+  const imposterNames = local.players.filter(p => p.isImposter).map(p => p.name);
+  let banner;
+  if (tie) banner = 'imposter';
+  else if (imposterNames.includes(votedOut)) banner = imposterNames.length === 1 ? 'crew' : 'imposter';
+  else banner = 'imposter';
+
+  if (banner === 'crew') local.players.forEach(p => { if (!p.isImposter) p.score++; });
+  else local.players.forEach(p => { if (p.isImposter) p.score++; });
+
+  localResult = { counts, tie, votedOut, imposterNames, banner };
+  localRenderResult();
+}
+
+function localRenderResult() {
+  if (!local || !localResult) return;
+  const { counts, tie, votedOut, imposterNames, banner } = localResult;
+  $('resultBanner').textContent =
+    banner === 'crew' ? '🎉 CREW WINS!' :
+    banner === 'imposter' ? '😈 IMPOSTERS WIN!' : '🤝 TIE';
+  $('resultBanner').className = 'banner ' + banner;
+  let detail = '';
+  if (tie) detail += 'VOTE TIED.<br>';
+  else if (votedOut) detail += `VOTED OUT: <strong>${esc(votedOut)}</strong><br>`;
+  detail += `IMPOSTER${imposterNames.length>1?'S':''}: ` +
+    imposterNames.map(n => `<strong>${esc(n)}</strong>`).join(', ') +
+    `<br>WORD: <strong>${esc(local.word)}</strong>`;
+  $('resultDetail').innerHTML = detail;
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const topCount = entries.length ? entries[0][1] : 0;
+  $('voteSummary').innerHTML = entries.map(([n, c]) =>
+    `<div class="vote-row ${c === topCount && c > 0 && !tie ? 'top' : ''}">
+       <span>${esc(n)}${imposterNames.includes(n) ? ' 🤫' : ''}</span>
+       <span class="count">${c} VOTE${c === 1 ? '' : 'S'}</span></div>`
+  ).join('');
+  $('imposterBox').innerHTML =
+    `<div class="round-header">IMPOSTER${imposterNames.length>1?'S':''}</div>` +
+    imposterNames.map(n => `<span class="imposter-pill">🕵️ ${esc(n)}</span>`).join(' ');
+  const sorted = [...local.players].sort((a, b) => b.score - a.score);
+  $('scoreboard').innerHTML = '<h4>SESSION SCORES</h4>' +
+    sorted.map(p => `<div class="score-row"><span>${esc(p.name)}</span><span class="pts">${p.score} WIN${p.score===1?'':'S'}</span></div>`).join('');
+  $('resultClues').innerHTML = '<div class="round-header">ROUND 2 DATA</div>' +
+    local.players.map(p =>
+      p.clue ? `<div class="clue-item"><span class="name">${esc(p.name)}:</span> ${esc(p.clue)}</div>` :
+      p.clueAudio ? `<div class="clue-item"><span class="name">${esc(p.name)}:</span> 🎙️ VOICE
+        <button class="play-btn" onclick="playAudio('${p.clueAudio}')">▶ Play</button></div>` :
+      `<div class="clue-item"><span class="name">${esc(p.name)}:</span> —</div>`
+    ).join('');
+  $('playAgainBtn').style.display = 'block';
+  $('resultProgress').textContent = '';
+  show('screen-result');
+}
+
+function startLocalGameWithScores(scores) {
+  const n = local.players.length;
+  const lang = local.lang;
+  const numImposters = local.numImposters;
+  const bank = localWordCache || [];
+  const entry = bank[Math.floor(Math.random() * bank.length)][lang];
+  const imposterIndices = new Set();
+  while (imposterIndices.size < numImposters) {
+    imposterIndices.add(Math.floor(Math.random() * n));
+  }
+  const names = local.players.map(p => p.name);
+  local = {
+    lang,
+    word: entry.word,
+    imposterHint: entry.imposter_hint,
+    imposterIndices: [...imposterIndices],
+    numImposters,
+    players: names.map((name, i) => ({
+      name,
+      isImposter: imposterIndices.has(i),
+      clue: '', clueAudio: null, vote: null,
+      score: scores[i] || 0,
+    })),
+    round: 1, phase: 'pass',
+    passIndex: 0, clueIndex: 0, voteIndex: 0,
+    selectedVote: null,
+  };
+  localResult = null;
+  localRenderPass();
+}
+
+// ============================================================================
+// RECORDER
+// ============================================================================
+function pickMimeType() {
+  if (!window.MediaRecorder) return '';
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'];
+  for (const t of candidates) {
+    if (MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';
+}
+
 async function toggleRecording() {
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    stopRecording();
+  if (mediaRecorder && mediaRecorder.state === 'recording') return stopRecording();
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $('clueError').textContent = 'RECORDING UNSUPPORTED ON THIS DEVICE.';
     return;
   }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     recordedChunks = [];
-    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-    mediaRecorder.ondataavailable = e => {
-      if (e.data.size > 0) recordedChunks.push(e.data);
-    };
-    mediaRecorder.onstop = async () => {
+    const mime = pickMimeType();
+    mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
+    mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = () => {
       stream.getTracks().forEach(t => t.stop());
-      const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+      const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
       const reader = new FileReader();
       reader.onloadend = () => {
         recordedAudioDataUrl = reader.result;
@@ -1452,18 +2263,16 @@ async function toggleRecording() {
       if (recordSeconds >= 10) stopRecording();
     }, 100);
   } catch (e) {
-    $('clueError').textContent = 'Mic permission denied or unavailable.';
+    $('clueError').textContent = 'MIC ACCESS DENIED.';
   }
 }
 
 function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    mediaRecorder.stop();
-  }
+  if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
   clearInterval(recordTimer);
   $('recBtn').classList.remove('recording');
   $('recBtn').textContent = '🎙️';
-  $('recInfo').innerHTML = 'Recorded! Tap ▶ to preview, or Clear to redo.';
+  $('recInfo').innerHTML = 'Audio captured. Tap ▶ to preview.';
 }
 
 function clearRecording() {
@@ -1472,194 +2281,11 @@ function clearRecording() {
   $('recPlayback').src = '';
   $('voiceSubmitBtn').style.display = 'none';
   $('recClearBtn').style.display = 'none';
-  $('recInfo').innerHTML = 'Tap the mic to record a voice clue.<br>Max 10 seconds.';
-}
-
-async function submitClue() {
-  if (!session) return;
-  $('clueError').textContent = '';
-  const text = $('clueInput').value.trim();
-  if (!text) { $('clueError').textContent = 'Please type a clue.'; return; }
-  try { applyState(await api('clue', { ...session, text })); }
-  catch (e) {
-    const m = { contains_word: '❌ Your clue contains the secret word!' };
-    $('clueError').textContent = m[e.message] || e.message;
-  }
-}
-
-async function submitVoice() {
-  if (!session || !recordedAudioDataUrl) return;
-  $('clueError').textContent = '';
-  try {
-    applyState(await api('audio', { ...session, audio: recordedAudioDataUrl }));
-    clearRecording();
-  } catch (e) {
-    const m = { audio_too_large: 'Recording too large. Try a shorter clip.' };
-    $('clueError').textContent = m[e.message] || e.message;
-  }
+  $('recInfo').innerHTML = 'Tap to record voice transmission.<br>Max 10 seconds.';
 }
 
 // ============================================================================
-//  SUMMARY
-// ============================================================================
-function renderSummary(s) {
-  show('screen-summary');
-  $('summaryHeader').textContent = `ROUND ${s.round} COMPLETE`;
-  const list = $('summaryList');
-  list.innerHTML = '';
-  s.players.forEach(p => {
-    const d = document.createElement('div');
-    d.className = 'clue-item' + (p.name === s.you.name ? ' mine' : '');
-    if (p.clue) {
-      d.innerHTML = `<span class="name">${esc(p.name)}:</span> ${esc(p.clue)}`;
-    } else if (p.clue_audio) {
-      d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ voice clue
-        <button class="play-btn" onclick="playAudio('${p.clue_audio}')">▶ Play</button>`;
-    } else {
-      d.innerHTML = `<span class="name">${esc(p.name)}:</span> —`;
-    }
-    list.appendChild(d);
-  });
-  const btn = $('summaryNextBtn');
-  if (s.is_host) {
-    btn.style.display = 'block';
-    btn.textContent = s.round === 1 ? 'Start Round 2 →' : 'Go to voting →';
-  } else {
-    btn.style.display = 'none';
-  }
-  $('chatFab').style.display = 'flex';
-}
-
-function playAudio(dataUrl) {
-  const a = new Audio(dataUrl);
-  a.play().catch(() => alert('Tap again to play'));
-}
-
-async function hostAdvance() {
-  if (!session) return;
-  try { applyState(await api('advance', session)); }
-  catch (e) { alert(e.message); }
-}
-
-// ============================================================================
-//  VOTE
-// ============================================================================
-function renderVote(s) {
-  show('screen-vote');
-  const voted = s.you.has_voted;
-  if (voted) selectedVote = null;
-  $('voteSubmitBtn').disabled = !selectedVote || voted;
-  $('voteSubmitBtn').textContent = voted ? 'Vote locked ✅' : 'Lock in vote';
-  const list = $('voteList');
-  list.innerHTML = '';
-  s.players.forEach(p => {
-    const btn = document.createElement('button');
-    btn.className = 'vote-btn' + (p.name === selectedVote ? ' selected' : '') + (voted ? ' done' : '');
-    btn.textContent = p.name + (p.name === s.you.name ? ' (you)' : '');
-    if (p.name === s.you.name) btn.disabled = true;
-    else if (!voted) {
-      btn.onclick = () => {
-        selectedVote = p.name;
-        document.querySelectorAll('.vote-btn').forEach(b => b.classList.remove('selected'));
-        btn.classList.add('selected');
-        $('voteSubmitBtn').disabled = false;
-      };
-    }
-    list.appendChild(btn);
-  });
-  const wl = $('voteWaitingList');
-  wl.innerHTML = '';
-  s.players.forEach(p => {
-    const d = document.createElement('div');
-    d.className = 'player-row';
-    d.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${p.has_voted ? '✅ voted' : '⏳ waiting'}</span>`;
-    wl.appendChild(d);
-  });
-  $('chatFab').style.display = 'flex';
-}
-
-async function submitVote() {
-  if (!session || !selectedVote) return;
-  $('voteError').textContent = '';
-  try {
-    const r = await api('vote', { ...session, target: selectedVote });
-    selectedVote = null;
-    applyState(r);
-  } catch (e) { $('voteError').textContent = e.message; }
-}
-
-// ============================================================================
-//  RESULT
-// ============================================================================
-function renderResult(s) {
-  show('screen-result');
-  const imposterNames = s.imposter_names || [];
-  const banner = $('resultBanner');
-  let title = '', cls = '';
-  if (s.result_banner === 'crew') { title = '🎉 CREW WINS!'; cls = 'crew'; }
-  else if (s.result_banner === 'imposter') { title = '😈 IMPOSTERS WIN!'; cls = 'imposter'; }
-  else { title = '🤝 TIE'; cls = 'tie'; }
-  banner.textContent = title;
-  banner.className = 'banner ' + cls;
-
-  let detail = '';
-  if (s.vote_tie) detail += `The vote was a tie.<br>`;
-  else if (s.voted_out_name) detail += `Voted out: <strong>${esc(s.voted_out_name)}</strong>.<br>`;
-  detail += `Imposter${imposterNames.length>1?'s':''}: ` +
-            imposterNames.map(n => `<strong>${esc(n)}</strong>`).join(', ') +
-            `<br>Secret word: <strong>${esc(s.secret_word)}</strong>.`;
-  $('resultDetail').innerHTML = detail;
-
-  const tally = s.vote_counts || {};
-  const entries = Object.entries(tally).sort((a, b) => b[1] - a[1]);
-  const topCount = entries.length ? entries[0][1] : 0;
-  const box = $('voteSummary');
-  box.innerHTML = '';
-  entries.forEach(([name, count]) => {
-    const row = document.createElement('div');
-    row.className = 'vote-row' + (count === topCount && count > 0 && !s.vote_tie ? ' top' : '');
-    row.innerHTML = `<span>${esc(name)}${imposterNames.includes(name) ? ' 🤫' : ''}</span>
-                     <span class="count">${count} vote${count === 1 ? '' : 's'}</span>`;
-    box.appendChild(row);
-  });
-
-  $('imposterBox').innerHTML =
-    `<div class="round-header">IMPOSTER${imposterNames.length>1?'S':''}</div>` +
-    imposterNames.map(n => `<span class="imposter-pill">🕵️ ${esc(n)}</span>`).join(' ');
-
-  const sb = $('scoreboard');
-  const scores = s.scores || {};
-  const sortedScores = Object.entries(scores).sort((a, b) => b[1] - a[1]);
-  if (sortedScores.length) {
-    sb.innerHTML = '<h4>🏆 Session scores</h4>' +
-      sortedScores.map(([n, v]) => `<div class="score-row"><span>${esc(n)}</span><span class="pts">${v} win${v===1?'':'s'}</span></div>`).join('');
-  }
-
-  const rc = $('resultClues');
-  rc.innerHTML = '<div class="round-header">ROUND 2 CLUES</div>';
-  s.players.forEach(p => {
-    const d = document.createElement('div');
-    d.className = 'clue-item' + (p.name === s.you.name ? ' mine' : '');
-    if (p.clue) d.innerHTML = `<span class="name">${esc(p.name)}:</span> ${esc(p.clue)}`;
-    else if (p.clue_audio) d.innerHTML = `<span class="name">${esc(p.name)}:</span> 🎙️ voice
-      <button class="play-btn" onclick="playAudio('${p.clue_audio}')">▶ Play</button>`;
-    else d.innerHTML = `<span class="name">${esc(p.name)}:</span> —`;
-    rc.appendChild(d);
-  });
-
-  $('playAgainBtn').style.display = s.is_host ? 'block' : 'none';
-  $('resultProgress').textContent = s.is_host ? '' : 'Waiting for host to start a new round...';
-  $('chatFab').style.display = 'flex';
-}
-
-async function playAgain() {
-  if (!session) return;
-  try { applyState(await api('reset', session)); }
-  catch (e) { alert(e.message); }
-}
-
-// ============================================================================
-//  CHAT
+// CHAT
 // ============================================================================
 function toggleChat() {
   chatOpen = !chatOpen;
@@ -1670,19 +2296,16 @@ function toggleChat() {
     setTimeout(() => $('chatInput').focus(), 100);
   }
 }
-
 function updateChatBadge(s) {
   if (!s.chat) return;
   const newCount = s.chat.length;
   if (newCount > lastChatCount && !chatOpen) {
-    const diff = newCount - lastChatCount;
     const badge = $('chatUnread');
-    badge.textContent = diff;
+    badge.textContent = newCount - lastChatCount;
     badge.style.display = 'flex';
   }
   lastChatCount = newCount;
 }
-
 function renderChat(s) {
   const box = $('chatMessages');
   if (!box) return;
@@ -1698,63 +2321,48 @@ function renderChat(s) {
     box.appendChild(d);
   });
   if (atBottom) box.scrollTop = box.scrollHeight;
-  // chat lock
   const locked = s.phase === 'clue' && !(s.you && (s.you.clue || s.you.clue_audio));
   $('chatLocked').style.display = locked ? 'block' : 'none';
   $('chatInputRow').style.display = locked ? 'none' : 'flex';
 }
-
 async function sendChat() {
-  if (!session) return;
+  if (!session || local) return;
   const input = $('chatInput');
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
-  try { applyState(await api('chat', { ...session, text })); }
-  catch (e) {
+  try {
+    const r = await api('chat', { ...session, text });
+    if (r && r.phase) applyState(r);
+  } catch (e) {
     const m = {
-      chat_locked: 'Chat is locked right now.',
-      chat_blocked_during_clue: 'Submit your clue first!'
+      chat_locked: 'COMMS LOCKED.',
+      chat_blocked_during_clue: 'SUBMIT CLUE FIRST!',
+      empty: 'TYPE MESSAGE.',
     };
     alert(m[e.message] || e.message);
   }
 }
 
 // ============================================================================
-//  MENU / LEAVE / END
+// MENU
 // ============================================================================
-function toggleMenu() {
-  $('menuPanel').classList.toggle('open');
-}
-
+function toggleMenu() { $('menuPanel').classList.toggle('open'); }
 async function leaveGame() {
   if (!session) return;
-  if (!confirm('Leave this game? You cannot rejoin without the code.')) return;
+  if (!confirm('Disconnect from lobby?')) return;
   try { await api('leave', session); } catch (e) {}
-  saveSession(null);
-  stopPolling();
-  $('chatFab').style.display = 'none';
-  $('menuFab').style.display = 'none';
-  $('menuPanel').classList.remove('open');
-  show('screen-home');
-  err('You left the game.');
+  saveSession(null); stopPolling(); backToMode();
 }
-
 async function endGame() {
   if (!session) return;
-  if (!confirm('End game for everyone? All players will be kicked out.')) return;
+  if (!confirm('Terminate lobby for all agents?')) return;
   try { await api('end', session); } catch (e) {}
-  saveSession(null);
-  stopPolling();
-  $('chatFab').style.display = 'none';
-  $('menuFab').style.display = 'none';
-  $('menuPanel').classList.remove('open');
-  show('screen-home');
-  err('Game ended.');
+  saveSession(null); stopPolling(); backToMode();
 }
 
 // ============================================================================
-//  BOOT
+// BOOT
 // ============================================================================
 (async function boot() {
   if (session) {
@@ -1764,8 +2372,12 @@ async function endGame() {
     catch (e) { saveSession(null); }
   }
   const params = new URLSearchParams(location.search);
-  if (params.get('code')) showJoin();
-  show('screen-home');
+  if (params.get('code')) {
+    show('screen-home');
+    showJoin();
+  } else {
+    show('screen-mode');
+  }
 })();
 
 $('playerName').addEventListener('keydown', e => { if (e.key === 'Enter') $('joinCode').focus(); });
@@ -1792,13 +2404,13 @@ class ThreadingServer(socketserver.ThreadingTCPServer):
 
 
 def _graceful_shutdown(sig, frame):
-    print("\n[SHUTDOWN] Cleaning up...")
+    print("\n[SHUTDOWN]")
     sys.exit(0)
 
 
 def main():
     signal.signal(signal.SIGTERM, _graceful_shutdown)
-    print(f"[BOOT] Imposter Word on port {PORT} | RENDER={os.environ.get('RENDER', 'no')}")
+    print(f"[BOOT] port={PORT} RENDER={os.environ.get('RENDER', 'no')}")
     with ThreadingServer(("0.0.0.0", PORT), GameHandler) as httpd:
         print(f"[BOOT] Listening on 0.0.0.0:{PORT}")
         if not os.environ.get("RENDER"):
