@@ -2460,6 +2460,9 @@ async function createGame() {
   err('');
   const name = $('playerName').value.trim();
   if (!name) return err('Enter Agent Name');
+  if (window.__STATIC_DATA__) {
+    return err('Online multiplayer requires the Python server. Tap "← Disconnect" and choose Local Terminal (Pass & Play) to play right here!');
+  }
   const lang = $('lang').value;
   try {
     await ensureWordCache();
@@ -2475,6 +2478,9 @@ async function joinGame() {
   const name = $('playerName').value.trim();
   const code = $('joinCode').value.trim().toUpperCase();
   if (!name) return err('Enter Agent Name');
+  if (window.__STATIC_DATA__) {
+    return err('Online multiplayer requires the Python server. Tap "← Disconnect" and choose Local Terminal (Pass & Play) to play right here!');
+  }
   if (code.length !== 6) return err('Invalid Lobby Code (6 chars)');
   try {
     await ensureWordCache();
@@ -3163,6 +3169,17 @@ $('localNumPlayers').addEventListener('input', renderLocalNameInputs);
 
 async function ensureWordCache() {
   if (localWordCache) return localWordCache;
+  if (window.__STATIC_DATA__) {
+    const r = window.__STATIC_DATA__;
+    localWordCache = r.words;
+    if (r.levels) {
+      const normalized = {};
+      Object.entries(r.levels).forEach(([k, v]) => { normalized[Number(k)] = v; });
+      LEVELS_DATA = normalized;
+    }
+    if (r.categories) CATEGORIES_DATA = r.categories;
+    return localWordCache;
+  }
   try {
     const r = await apiGet('words');
     localWordCache = r.words;
@@ -3897,14 +3914,14 @@ async function endGame() {
 // ============================================================================
 (async function boot() {
   await ensureWordCache();
-  if (session) {
+  if (!window.__STATIC_DATA__ && session) {
     $('resumeHint').style.display = 'block';
     $('playerName').value = session.name || '';
     try { applyState(await api('state', session)); return; }
     catch (e) { saveSession(null); }
   }
   const params = new URLSearchParams(location.search);
-  if (params.get('code')) {
+  if (!window.__STATIC_DATA__ && params.get('code')) {
     show('screen-home');
     showJoin();
   } else {
